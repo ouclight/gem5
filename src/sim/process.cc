@@ -358,26 +358,38 @@ Process::deallocateMem(Addr vaddr, int64_t size)
         const Addr page_vaddr = page_vbase + page_size * i;
         Addr page_paddr;
         if (pTable->translate(page_vaddr, page_paddr)) {
-            if (zeroPages) {
-                // Zero out the physical page upon deallocation.
-                // Pages that have never been allocated before are already
-                // zero-filled. Zeroing out deallocated pages ensures that
-                // if they're ever reallocated, they will be zero-filled.
-                // Note that zeroing out pages before allocation would
-                // achieve the same result, but would be more expensive
-                // because it would unnecessarily zero out pages that
-                // were allocated for the first time.
-                SETranslatingPortProxy virt_mem(
-                    system->threads[0], SETranslatingPortProxy::Always);
-                const std::vector<uint8_t> zero_page(page_size, 0);
-                virt_mem.writeBlob(page_vaddr, zero_page.data(), page_size);
-            }
-
             // Unmap the virtual page.
             pTable->unmap(page_vaddr, page_size);
 
-            // Deallocate the physical page.
-            seWorkload->deallocPhysPage(page_paddr);
+            /**
+             * Device and shared mappings can alias one physical page at
+             * multiple virtual addresses. Only return the physical page once
+             * the last VA mapping is gone.
+             */
+            bool aliased = false;
+            std::vector<std::pair<Addr, Addr>> mappings;
+            pTable->getMappings(&mappings);
+            for (const auto &mapping: mappings) {
+                if (mapping.second == page_paddr) {
+                    aliased = true;
+                    break;
+                }
+            }
+
+            if (!aliased) {
+                if (zeroPages) {
+                    // Zero out the physical page upon final deallocation.
+                    // Pages that have never been allocated before are already
+                    // zero-filled. Zeroing out deallocated pages ensures that
+                    // if they're ever reallocated, they will be zero-filled.
+                    // Use the saved physical address because page_vaddr has
+                    // already been unmapped.
+                    const std::vector<uint8_t> zero_page(page_size, 0);
+                    system->physProxy.writeBlob(
+                        page_paddr, zero_page.data(), page_size);
+                }
+                seWorkload->deallocPhysPage(page_paddr);
+            }
         }
     }
 }

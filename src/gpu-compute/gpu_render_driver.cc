@@ -28,6 +28,8 @@
 
 #include "gpu-compute/gpu_render_driver.hh"
 
+#include "base/trace.hh"
+#include "debug/GPUDriver.hh"
 #include "params/GPURenderDriver.hh"
 #include "sim/fd_entry.hh"
 
@@ -49,7 +51,17 @@ GPURenderDriver::open(ThreadContext *tc, int mode, int flags)
     auto process = tc->getProcessPtr();
     auto device_fd_entry = std::make_shared<DeviceFDEntry>(this, filename);
     int tgt_fd = process->fds->allocFD(device_fd_entry);
+    DPRINTF(GPUDriver, "Opened GPU render driver %s as target fd %d\n",
+            filename, tgt_fd);
     return tgt_fd;
+}
+
+int
+GPURenderDriver::ioctl(ThreadContext *tc, unsigned req, Addr buf)
+{
+    warn("Unsupported GPU render driver ioctl on %s: req %#x buf %#x\n",
+         filename, req, buf);
+    return -EBADF;
 }
 
 /* DGPUs try to mmap the driver file. It doesn't appear they do anything

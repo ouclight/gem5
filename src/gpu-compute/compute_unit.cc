@@ -1318,7 +1318,7 @@ ComputeUnit::sendRequest(GPUDynInstPtr gpuDynInst, PortID index, PacketPtr pkt)
     // In full system mode these can be extracted from the PTE and assigned
     // after address translation takes place.
     if (!FullSystem) {
-        shader->gpuCmdProc.driver()->setMtype(pkt->req);
+        shader->gpuCmdProc.driver()->setMtype(pkt->req, &shader->gpuCmdProc);
     }
 
     // Check write before read for atomic operations

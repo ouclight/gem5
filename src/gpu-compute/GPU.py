@@ -335,7 +335,16 @@ class GPUComputeDriver(EmulatedDriver):
     type = "GPUComputeDriver"
     cxx_class = "gem5::GPUComputeDriver"
     cxx_header = "gpu-compute/gpu_compute_driver.hh"
-    device = Param.GPUCommandProcessor("GPU controlled by this driver")
+    device = Param.GPUCommandProcessor(
+        NULL, "GPU controlled by this driver"
+    )
+    devices = VectorParam.GPUCommandProcessor(
+        [], "GPUs controlled by this driver"
+    )
+    gpuIds = VectorParam.UInt32([], "KFD GPU IDs controlled by this driver")
+    vramPoolIds = VectorParam.Int(
+        [], "SE physical memory pool IDs for each GPU's local VRAM"
+    )
     isdGPU = Param.Bool(False, "Driver is for a dGPU")
     gfxVersion = Param.GfxVersion("gfx902", "ISA of gpu to model")
     dGPUPoolID = Param.Int(0, "Pool ID for dGPU.")

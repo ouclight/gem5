@@ -38,6 +38,7 @@ machine(MachineType:Directory, "AMD Baseline protocol")
   bool CPUonly := "False";
   bool GPUonly := "False";
   int TCC_select_num_bits;
+  int TCC_select_cluster_id := 0;
   bool useL3OnWT := "False";
   bool L2isWB;
   Cycles to_memory_controller_latency := 1;
@@ -715,11 +716,13 @@ machine(MachineType:Directory, "AMD Baseline protocol")
         if (noTCCdir) {
           probe_dests.add(mapAddressToRange(address, MachineType:TCC,
                                             TCC_select_low_bit,
-                                            TCC_select_num_bits));
+                                            TCC_select_num_bits,
+                                            intToID(TCC_select_cluster_id)));
         } else {
           probe_dests.add(mapAddressToRange(address, MachineType:TCCdir,
                                             TCC_select_low_bit,
-                                            TCC_select_num_bits));
+                                            TCC_select_num_bits,
+                                            intToID(TCC_select_cluster_id)));
         }
       }
       probe_dests.remove(in_msg.Requestor);
@@ -776,11 +779,13 @@ machine(MachineType:Directory, "AMD Baseline protocol")
           if (noTCCdir) {
             probe_dests.add(mapAddressToRange(address, MachineType:TCC,
                                               TCC_select_low_bit,
-                                              TCC_select_num_bits));
+                                              TCC_select_num_bits,
+                                              intToID(TCC_select_cluster_id)));
           } else {
             probe_dests.add(mapAddressToRange(address, MachineType:TCCdir,
                                               TCC_select_low_bit,
-                                              TCC_select_num_bits));
+                                              TCC_select_num_bits,
+                                              intToID(TCC_select_cluster_id)));
           }
         }
       }
@@ -835,13 +840,15 @@ machine(MachineType:Directory, "AMD Baseline protocol")
         if (!noTCCdir) {
           probe_dests.add(mapAddressToRange(address, MachineType:TCCdir,
                                             TCC_select_low_bit,
-                                            TCC_select_num_bits));
+                                            TCC_select_num_bits,
+                                            intToID(TCC_select_cluster_id)));
         }
 
         if (GPUonly && L2isWB) {
           probe_dests.add(mapAddressToRange(address, MachineType:TCC,
                                             TCC_select_low_bit,
-                                            TCC_select_num_bits));
+                                            TCC_select_num_bits,
+                                            intToID(TCC_select_cluster_id)));
         }
       }
       probe_dests.remove(in_msg.Requestor);
@@ -893,7 +900,8 @@ machine(MachineType:Directory, "AMD Baseline protocol")
         if (!noTCCdir) {
           probe_dests.add(mapAddressToRange(address, MachineType:TCCdir,
                                             TCC_select_low_bit,
-                                            TCC_select_num_bits));
+                                            TCC_select_num_bits,
+                                            intToID(TCC_select_cluster_id)));
         }
       }
       probe_dests.remove(in_msg.Requestor);
@@ -946,11 +954,13 @@ machine(MachineType:Directory, "AMD Baseline protocol")
         if (noTCCdir) {
           probe_dests.add(mapAddressToRange(address, MachineType:TCC,
                                             TCC_select_low_bit,
-                                            TCC_select_num_bits));
+                                            TCC_select_num_bits,
+                                            intToID(TCC_select_cluster_id)));
         } else {
           probe_dests.add(mapAddressToRange(address, MachineType:TCCdir,
                                             TCC_select_low_bit,
-                                            TCC_select_num_bits));
+                                            TCC_select_num_bits,
+                                            intToID(TCC_select_cluster_id)));
         }
       }
       probe_dests.remove(in_msg.Requestor);
@@ -1622,6 +1632,16 @@ machine(MachineType:Directory, "AMD Baseline protocol")
   }
 
   transition(BL2, L3Hit, BL2_Pm) {
+    ptl_popTriggerQueue;
+  }
+
+  transition(BL2_M, L3Hit, U) {
+    // Probe acknowledgements may complete before the delayed L3 hit trigger.
+    // The L3 data is already in the TBE, and no memory read was issued.
+    dd_sendResponseDmaData;
+    wada_wakeUpAllDependentsAddr;
+    pd_popDmaRequestQueue;
+    dt_deallocateTBE;
     ptl_popTriggerQueue;
   }
 

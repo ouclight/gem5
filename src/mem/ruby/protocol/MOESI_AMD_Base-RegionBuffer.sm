@@ -38,6 +38,7 @@ machine(MachineType:RegionBuffer, "Region Buffer for AMD_Base-like protocol")
   Cycles nextEvictLatency := 1;   // latency added between each block while evicting region
   bool noTCCdir := "False";
   int TCC_select_num_bits := 1;
+  int TCC_select_cluster_id := 0;
 
   // From the Cores
   MessageBuffer * requestFromCore, network="From", virtual_network="0", vnet_type="request";
@@ -226,9 +227,11 @@ machine(MachineType:RegionBuffer, "Region Buffer for AMD_Base-like protocol")
       return createMachineID(MachineType:CorePair, intToID(0));
     } else if (noTCCdir) {
       return mapAddressToRange(address,MachineType:TCC,
-                                  TCC_select_low_bit, TCC_select_num_bits);
+                                  TCC_select_low_bit, TCC_select_num_bits,
+                                  intToID(TCC_select_cluster_id));
     } else {
-      return createMachineID(MachineType:TCCdir, intToID(0));
+      return createMachineID(MachineType:TCCdir,
+                             intToID(TCC_select_cluster_id));
     }
   }
 

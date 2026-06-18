@@ -305,6 +305,16 @@ GPUCommandProcessor::dispatchKernelObject(AMDKernelCode *akc, void *raw_pkt,
                                         uint32_t queue_id, Addr host_pkt_addr)
 {
     _hsa_dispatch_packet_t *disp_pkt = (_hsa_dispatch_packet_t*)raw_pkt;
+    GfxVersion gfxVersion = FullSystem ? gpuDevice->getGfxVersion()
+                                      : driver()->getGfxVersion();
+
+    // ROCm 4 gfx900 code objects use the kernarg preload descriptor bits for
+    // other purposes. Interpreting them as preload metadata corrupts both the
+    // SGPR initialization and the machine-code entry address.
+    if (gfxVersion == GfxVersion::gfx900) {
+        akc->kernarg_preload_spec_length = 0;
+        akc->kernarg_preload_spec_offset = 0;
+    }
 
     /**
      * If the kernarg_preload_spec_length is non-zero, the CP firmware will
@@ -349,8 +359,6 @@ GPUCommandProcessor::dispatchKernelObject(AMDKernelCode *akc, void *raw_pkt,
 
     DPRINTF(GPUKernelInfo, "Kernel name: %s\n", kernel_name.c_str());
 
-    GfxVersion gfxVersion = FullSystem ? gpuDevice->getGfxVersion()
-                          : driver()->getGfxVersion();
     HSAQueueEntry *task = new HSAQueueEntry(kernel_name, queue_id,
         dynamic_task_id, raw_pkt, akc, host_pkt_addr, machine_code_addr,
         gfxVersion);
@@ -734,6 +742,17 @@ GPUCommandProcessor::readPreload(AMDKernelCode *akc, HSAQueueEntry *task)
 
     DPRINTF(GPUCommandProc, "Kernarg preload starts at addr: %#x\n",
             preload_addr);
+
+    if (!FullSystem) {
+        auto *tc = sys->threads[0];
+        SETranslatingPortProxy virt_proxy(tc);
+        virt_proxy.readBlob(
+            preload_addr,
+            reinterpret_cast<uint8_t *>(task->preloadArgs()),
+            sizeof(uint32_t) * akc->kernarg_preload_spec_length);
+        initPreload(akc, task);
+        return;
+    }
 
     /**
      * In full system mode, the page table entry may point to a system

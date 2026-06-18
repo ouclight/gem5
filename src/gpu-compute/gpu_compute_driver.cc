@@ -62,7 +62,36 @@ GPUComputeDriver::GPUComputeDriver(const Params &p)
       isdGPU(p.isdGPU), gfxVersion(p.gfxVersion), dGPUPoolID(p.dGPUPoolID),
       eventPage(0), eventSlotIndex(0)
 {
-    device->attachDriver(this);
+    devices = p.devices;
+    if (devices.empty()) {
+        fatal_if(!device, "%s requires at least one GPU device\n", name());
+        devices.push_back(device);
+    } else {
+        device = devices.front();
+    }
+
+    fatal_if(!p.gpuIds.empty() && p.gpuIds.size() != devices.size(),
+             "%s gpuIds size (%d) must match devices size (%d)\n",
+             name(), p.gpuIds.size(), devices.size());
+    fatal_if(!p.vramPoolIds.empty() && p.vramPoolIds.size() != devices.size(),
+             "%s vramPoolIds size (%d) must match devices size (%d)\n",
+             name(), p.vramPoolIds.size(), devices.size());
+
+    for (int i = 0; i < devices.size(); ++i) {
+        auto *gpu_device = devices[i];
+        fatal_if(!gpu_device, "%s devices[%d] is null\n", name(), i);
+        gpu_device->attachDriver(this);
+
+        uint32_t gpu_id = p.gpuIds.empty() ? (isdGPU ? 22124 : 2765) + i :
+            p.gpuIds[i];
+        fatal_if(gpuIdToDeviceIdx.count(gpu_id),
+                 "%s duplicate gpu_id %d\n", name(), gpu_id);
+        gpuIdToDeviceIdx[gpu_id] = i;
+        deviceToGpuId[gpu_device] = gpu_id;
+        vramPoolIds.push_back(p.vramPoolIds.empty() ? dGPUPoolID :
+            p.vramPoolIds[i]);
+    }
+
     DPRINTF(GPUDriver, "Constructing KFD: device\n");
 
     // Convert the 3 bit mtype specified in Shader.py to the proper type
@@ -97,6 +126,9 @@ GPUComputeDriver::open(ThreadContext *tc, int mode, int flags)
     auto process = tc->getProcessPtr();
     auto device_fd_entry = std::make_shared<DeviceFDEntry>(this, filename);
     int tgt_fd = process->fds->allocFD(device_fd_entry);
+    DPRINTF(GPUDriver,
+            "Opened KFD driver %s as target fd %d with %d GPU devices\n",
+            filename, tgt_fd, devices.size());
     return tgt_fd;
 }
 
@@ -117,10 +149,28 @@ GPUComputeDriver::mmap(ThreadContext *tc, Addr start, uint64_t length,
             "offset: 0x%x)\n", start, length, offset);
 
     switch(mmap_type) {
+        case 0:
+            if (offset != 0) {
+                warn_once("Unrecognized kfd mmap type %llx\n", mmap_type);
+                break;
+            }
+
+            DPRINTF(GPUDriver, "amdkfd mmap type default offset\n");
+            if (start == 0) {
+                start = mem_state->extendMmap(length);
+            } else if (!mem_state->isUnmapped(start, length)) {
+                warn_once("Ignoring KFD mmap over existing range "
+                          "[%#x:%#x]\n", start, start + length);
+                break;
+            }
+            mem_state->mapRegion(start, length, "kfd");
+            process->allocateMem(start, length);
+            break;
         case KFD_MMAP_TYPE_DOORBELL:
             DPRINTF(GPUDriver, "amdkfd mmap type DOORBELL offset\n");
             start = mem_state->extendMmap(length);
-            process->pTable->map(start, device->hsaPacketProc().pioAddr,
+            process->pTable->map(start,
+                    deviceForGpuId(mmapGpuId(pg_off)).hsaPacketProc().pioAddr,
                     length, false);
             break;
         case KFD_MMAP_TYPE_EVENTS:
@@ -161,6 +211,13 @@ GPUComputeDriver::allocateQueue(PortProxy &mem_proxy, Addr ioc_buf)
     TypedBufferArg<kfd_ioctl_create_queue_args> args(ioc_buf);
     args.copyIn(mem_proxy);
 
+    DPRINTF(GPUDriver,
+            "AMDKFD_IOC_CREATE_QUEUE gpu_id %u type %u ring_base %#x "
+            "ring_size %#x read_ptr %#x write_ptr %#x\n",
+            args->gpu_id, args->queue_type, args->ring_base_address,
+            args->ring_size, args->read_pointer_address,
+            args->write_pointer_address);
+
     if ((doorbellSize() * queueId) > 4096) {
         fatal("%s: Exceeded maximum number of HSA queues allowed\n", name());
     }
@@ -173,11 +230,15 @@ GPUComputeDriver::allocateQueue(PortProxy &mem_proxy, Addr ioc_buf)
         args->doorbell_offset += queueId * doorbellSize();
 
     args->queue_id = queueId++;
-    auto &hsa_pp = device->hsaPacketProc();
+    auto &hsa_pp = deviceForGpuId(args->gpu_id).hsaPacketProc();
+    queueIdToDeviceIdx[args->queue_id] = gpuIdToDeviceIdx.at(args->gpu_id);
     hsa_pp.setDeviceQueueDesc(args->read_pointer_address,
                               args->ring_base_address, args->queue_id,
                               args->ring_size, doorbellSize(), gfxVersion);
     args.copyOut(mem_proxy);
+    DPRINTF(GPUDriver,
+            "AMDKFD_IOC_CREATE_QUEUE queue_id %u doorbell_offset %#x\n",
+            args->queue_id, args->doorbell_offset);
 }
 
 void
@@ -261,8 +322,9 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
             args.copyIn(virt_proxy);
             DPRINTF(GPUDriver, "ioctl: AMDKFD_IOC_DESTROY_QUEUE;" \
                     "queue offset %d\n", args->queue_id);
-            device->hsaPacketProc().unsetDeviceQueueDesc(args->queue_id,
-                                                         doorbellSize());
+            deviceForQueueId(args->queue_id).hsaPacketProc()
+                .unsetDeviceQueueDesc(args->queue_id, doorbellSize());
+            queueIdToDeviceIdx.erase(args->queue_id);
           }
           break;
         case AMDKFD_IOC_SET_MEMORY_POLICY:
@@ -280,7 +342,14 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
              * call.
              *
              */
-            warn("unimplemented ioctl: AMDKFD_IOC_SET_MEMORY_POLICY\n");
+            TypedBufferArg<kfd_ioctl_set_memory_policy_args> args(ioc_buf);
+            args.copyIn(virt_proxy);
+            deviceForGpuId(args->gpu_id);
+            warn("Ignoring AMDKFD_IOC_SET_MEMORY_POLICY gpu_id %d "
+                 "default_policy %d alternate_policy %d aperture [%#x:%#x]\n",
+                 args->gpu_id, args->default_policy, args->alternate_policy,
+                 args->alternate_aperture_base,
+                 args->alternate_aperture_base + args->alternate_aperture_size);
           }
           break;
         case AMDKFD_IOC_GET_CLOCK_COUNTERS:
@@ -310,7 +379,13 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
             DPRINTF(GPUDriver, "ioctl: AMDKFD_IOC_GET_PROCESS_APERTURES\n");
 
             TypedBufferArg<kfd_ioctl_get_process_apertures_args> args(ioc_buf);
-            args->num_of_nodes = 1;
+            args->num_of_nodes = devices.size();
+            fatal_if(args->num_of_nodes > NUM_OF_SUPPORTED_GPUS,
+                     "%s supports at most %d legacy aperture nodes\n",
+                     name(), NUM_OF_SUPPORTED_GPUS);
+            DPRINTF(GPUDriver,
+                    "AMDKFD_IOC_GET_PROCESS_APERTURES returning %d nodes\n",
+                    args->num_of_nodes);
 
             /**
              * Set the GPUVM/LDS/Scratch APEs exactly as they
@@ -329,10 +404,17 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
                 switch (gfxVersion) {
                   case GfxVersion::gfx900:
                   case GfxVersion::gfx902:
-                    args->process_apertures[i].scratch_base =
-                        scratchApeBaseV9();
-                    args->process_apertures[i].lds_base =
-                        ldsApeBaseV9();
+                    if (devices.size() > 1) {
+                        args->process_apertures[i].scratch_base =
+                            scratchApeBase(i + 1);
+                        args->process_apertures[i].lds_base =
+                            ldsApeBase(i + 1);
+                    } else {
+                        args->process_apertures[i].scratch_base =
+                            scratchApeBaseV9();
+                        args->process_apertures[i].lds_base =
+                            ldsApeBaseV9();
+                    }
                     break;
                   default:
                     fatal("Invalid gfx version\n");
@@ -366,23 +448,18 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
                 // The gpu_id is a device identifier used by the driver for
                 // ioctls that allocate arguments. Each device has an unique
                 // id composed out of a non-zero base and an offset.
-                if (isdGPU) {
-                    switch (gfxVersion) {
-                      case GfxVersion::gfx900:
-                        args->process_apertures[i].gpu_id = 22124;
-                        break;
-                      default:
-                        fatal("Invalid gfx version for dGPU\n");
-                    }
-                } else {
-                    switch (gfxVersion) {
-                      case GfxVersion::gfx902:
-                        args->process_apertures[i].gpu_id = 2765;
-                        break;
-                      default:
-                        fatal("Invalid gfx version for APU\n");
-                    }
-                }
+                args->process_apertures[i].gpu_id =
+                    deviceToGpuId.at(devices[i]);
+                DPRINTF(GPUDriver,
+                        "  aperture[%d] gpu_id %d gpuvm [%#x:%#x] "
+                        "scratch [%#x:%#x] lds [%#x:%#x]\n",
+                        i, args->process_apertures[i].gpu_id,
+                        args->process_apertures[i].gpuvm_base,
+                        args->process_apertures[i].gpuvm_limit,
+                        args->process_apertures[i].scratch_base,
+                        args->process_apertures[i].scratch_limit,
+                        args->process_apertures[i].lds_base,
+                        args->process_apertures[i].lds_limit);
 
                 DPRINTF(GPUDriver, "GPUVM base for node[%i] = %#x\n", i,
                         args->process_apertures[i].gpuvm_base);
@@ -437,6 +514,10 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
 
             TypedBufferArg<kfd_ioctl_create_event_args> args(ioc_buf);
             args.copyIn(virt_proxy);
+            DPRINTF(GPUDriver,
+                    "AMDKFD_IOC_CREATE_EVENT type %u node_id %u "
+                    "auto_reset %u\n",
+                    args->event_type, args->node_id, args->auto_reset);
             if (args->event_type != KFD_IOC_EVENT_SIGNAL) {
                 warn("Signal events are only supported currently\n");
             } else if (eventSlotIndex == SLOTS_PER_PAGE) {
@@ -604,17 +685,32 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
                 ioc_args(ioc_buf);
 
             ioc_args.copyIn(virt_proxy);
-            ioc_args->num_of_nodes = 1;
+            uint32_t capacity = ioc_args->num_of_nodes;
+            ioc_args->num_of_nodes = devices.size();
+            fatal_if(capacity < ioc_args->num_of_nodes,
+                     "%s aperture buffer has %d entries, need %d\n",
+                     name(), capacity, ioc_args->num_of_nodes);
+            DPRINTF(GPUDriver,
+                    "AMDKFD_IOC_GET_PROCESS_APERTURES_NEW capacity %d "
+                    "returning %d nodes to %#x\n",
+                    capacity, ioc_args->num_of_nodes,
+                    ioc_args->kfd_process_device_apertures_ptr);
 
             for (int i = 0; i < ioc_args->num_of_nodes; ++i) {
                 TypedBufferArg<kfd_process_device_apertures> ape_args
-                    (ioc_args->kfd_process_device_apertures_ptr);
+                    (ioc_args->kfd_process_device_apertures_ptr +
+                     i * sizeof(kfd_process_device_apertures));
 
                 switch (gfxVersion) {
                   case GfxVersion::gfx900:
                   case GfxVersion::gfx902:
-                    ape_args->scratch_base = scratchApeBaseV9();
-                    ape_args->lds_base = ldsApeBaseV9();
+                    if (devices.size() > 1) {
+                        ape_args->scratch_base = scratchApeBase(i + 1);
+                        ape_args->lds_base = ldsApeBase(i + 1);
+                    } else {
+                        ape_args->scratch_base = scratchApeBaseV9();
+                        ape_args->lds_base = ldsApeBaseV9();
+                    }
                     break;
                   default:
                     fatal("Invalid gfx version\n");
@@ -637,23 +733,14 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
                 }
 
                 // NOTE: Must match ID populated by hsaTopology.py
-                if (isdGPU) {
-                    switch (gfxVersion) {
-                      case GfxVersion::gfx900:
-                        ape_args->gpu_id = 22124;
-                        break;
-                      default:
-                        fatal("Invalid gfx version for dGPU\n");
-                    }
-                } else {
-                    switch (gfxVersion) {
-                      case GfxVersion::gfx902:
-                        ape_args->gpu_id = 2765;
-                        break;
-                      default:
-                        fatal("Invalid gfx version for APU\n");
-                    }
-                }
+                ape_args->gpu_id = deviceToGpuId.at(devices[i]);
+                DPRINTF(GPUDriver,
+                        "  aperture_new[%d] gpu_id %d gpuvm [%#x:%#x] "
+                        "scratch [%#x:%#x] lds [%#x:%#x]\n",
+                        i, ape_args->gpu_id,
+                        ape_args->gpuvm_base, ape_args->gpuvm_limit,
+                        ape_args->scratch_base, ape_args->scratch_limit,
+                        ape_args->lds_base, ape_args->lds_limit);
 
                 assert(bits<Addr>(ape_args->scratch_base, 63, 47) != 0x1ffff);
                 assert(bits<Addr>(ape_args->scratch_base, 63, 47) != 0);
@@ -672,7 +759,12 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
           break;
         case AMDKFD_IOC_ACQUIRE_VM:
           {
-            warn("unimplemented ioctl: AMDKFD_IOC_ACQUIRE_VM\n");
+            TypedBufferArg<kfd_ioctl_acquire_vm_args> args(ioc_buf);
+            args.copyIn(virt_proxy);
+            DPRINTF(GPUDriver,
+                    "AMDKFD_IOC_ACQUIRE_VM gpu_id %d drm_fd %d\n",
+                    args->gpu_id, args->drm_fd);
+            deviceForGpuId(args->gpu_id);
           }
           break;
          /**
@@ -697,12 +789,18 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
             TypedBufferArg<kfd_ioctl_alloc_memory_of_gpu_args> args(ioc_buf);
             args.copyIn(virt_proxy);
 
+            DPRINTF(GPUDriver,
+                    "AMDKFD_IOC_ALLOC_MEMORY_OF_GPU gpu_id %d va %#x "
+                    "size %#x flags %#x\n",
+                    args->gpu_id, args->va_addr, args->size, args->flags);
+
             assert(isdGPU || gfxVersion == GfxVersion::gfx902);
             assert((args->va_addr % X86ISA::PageBytes) == 0);
             [[maybe_unused]] Addr mmap_offset = 0;
 
             Request::CacheCoherenceFlags mtype = defaultMtype;
             Addr pa_addr = 0;
+            int pool_id = 0;
 
             int npages = divCeil(args->size, (int64_t)X86ISA::PageBytes);
             bool cacheable = true;
@@ -729,8 +827,8 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
                 // this as uncacheable from the CPU so that we can implement
                 // direct CPU framebuffer access similar to what we currently
                 // offer in real HW through the so-called Large BAR feature.
-                pa_addr = process->seWorkload->allocPhysPages(
-                        npages, dGPUPoolID);
+                pool_id = vramPoolForGpuId(args->gpu_id);
+                pa_addr = process->seWorkload->allocPhysPages(npages, pool_id);
                 //
                 // TODO: Uncacheable accesses need to be supported by the
                 // CPU-side protocol for this to work correctly.  I believe
@@ -787,7 +885,7 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
                 //
                 // Explicitly map this virtual address to our PIO doorbell
                 // interface in the page tables (non-cacheable)
-                pa_addr = device->hsaPacketProc().pioAddr;
+                pa_addr = deviceForGpuId(args->gpu_id).hsaPacketProc().pioAddr;
                 cacheable = false;
             }
 
@@ -810,12 +908,17 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
             // This is a simplified version of regular system VMAs, but for
             // GPUVM space (none of the clobber/remap nonsense we find in real
             // OS managed memory).
-            allocateGpuVma(mtype, args->va_addr, args->size);
+            allocateGpuVma(mtype, args->va_addr, args->size, args->gpu_id,
+                           pa_addr, pool_id);
 
             // Used by the runtime to uniquely identify this allocation.
             // We can just use the starting address of the VMA region.
             args->handle= args->va_addr;
             args.copyOut(virt_proxy);
+            DPRINTF(GPUDriver,
+                    "AMDKFD_IOC_ALLOC_MEMORY_OF_GPU handle %#x pa %#x "
+                    "pool %d mmap_offset %#x\n",
+                    args->handle, pa_addr, pool_id, args->mmap_offset);
           }
           break;
         case AMDKFD_IOC_FREE_MEMORY_OF_GPU:
@@ -828,9 +931,24 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
             DPRINTF(GPUDriver, "amdkfd free arguments: handle %p ",
                     args->handle);
 
-            // We don't recycle physical pages in SE mode
+            // We don't recycle physical pages in SE mode. Some ROCm teardown
+            // paths may free VMAs whose host mappings were already skipped or
+            // removed by earlier mmap handling, so only unmap pages that are
+            // still present in the SE page table.
             Addr size = deallocateGpuVma(args->handle);
-            process->pTable->unmap(args->handle, size);
+            Addr unmapped = 0;
+            for (Addr vaddr = args->handle; vaddr < args->handle + size;
+                 vaddr += X86ISA::PageBytes) {
+                if (process->pTable->lookup(vaddr)) {
+                    process->pTable->unmap(vaddr, X86ISA::PageBytes);
+                    unmapped += X86ISA::PageBytes;
+                }
+            }
+            if (unmapped != size) {
+                warn("AMDKFD_IOC_FREE_MEMORY_OF_GPU skipped %#x bytes not "
+                     "present in the SE page table for handle %#x\n",
+                     size - unmapped, args->handle);
+            }
 
             // TODO: IOMMU and GPUTLBs do not seem to correctly support
             // shootdown.  This is also a potential issue for APU systems
@@ -849,12 +967,55 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
          */
         case AMDKFD_IOC_MAP_MEMORY_TO_GPU:
           {
-            warn("unimplemented ioctl: AMDKFD_IOC_MAP_MEMORY_TO_GPU\n");
+            DPRINTF(GPUDriver, "ioctl: AMDKFD_IOC_MAP_MEMORY_TO_GPU\n");
+            TypedBufferArg<kfd_ioctl_map_memory_to_gpu_args> args(ioc_buf);
+            args.copyIn(virt_proxy);
+
+            auto vma = gpuVmaInfo.contains(args->handle);
+            fatal_if(vma == gpuVmaInfo.end() ||
+                     vma->first.start() != args->handle,
+                     "Cannot map unknown GPU allocation handle %#x\n",
+                     args->handle);
+
+            DPRINTF(GPUDriver,
+                    "AMDKFD_IOC_MAP_MEMORY_TO_GPU handle %#x "
+                    "start_success %u n_devices %u\n",
+                    args->handle, args->n_success, args->n_devices);
+
+            for (uint32_t i = args->n_success; i < args->n_devices; ++i) {
+                TypedBufferArg<uint32_t> gpu_id_arg(
+                    args->device_ids_array_ptr + i * sizeof(uint32_t),
+                    sizeof(uint32_t));
+                gpu_id_arg.copyIn(virt_proxy);
+                deviceForGpuId(*gpu_id_arg);
+                DPRINTF(GPUDriver, "  map target gpu_id %u\n", *gpu_id_arg);
+                vma->second.mappedGpuIds.insert(*gpu_id_arg);
+            }
+            args->n_success = args->n_devices;
+            args.copyOut(virt_proxy);
           }
           break;
         case AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU:
           {
-            warn("unimplemented ioctl: AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU\n");
+            DPRINTF(GPUDriver, "ioctl: AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU\n");
+            TypedBufferArg<kfd_ioctl_unmap_memory_from_gpu_args> args(ioc_buf);
+            args.copyIn(virt_proxy);
+
+            auto vma = gpuVmaInfo.contains(args->handle);
+            fatal_if(vma == gpuVmaInfo.end() ||
+                     vma->first.start() != args->handle,
+                     "Cannot unmap unknown GPU allocation handle %#x\n",
+                     args->handle);
+
+            for (uint32_t i = 0; i < args->n_devices; ++i) {
+                TypedBufferArg<uint32_t> gpu_id_arg(
+                    args->device_ids_array_ptr + i * sizeof(uint32_t),
+                    sizeof(uint32_t));
+                gpu_id_arg.copyIn(virt_proxy);
+                vma->second.mappedGpuIds.erase(*gpu_id_arg);
+            }
+            args->n_success = args->n_devices;
+            args.copyOut(virt_proxy);
           }
           break;
         case AMDKFD_IOC_SET_CU_MASK:
@@ -960,13 +1121,25 @@ GPUComputeDriver::ldsApeLimit(Addr apeBase) const
 
 void
 GPUComputeDriver::allocateGpuVma(Request::CacheCoherenceFlags mtype,
-                                 Addr start, Addr length)
+                                 Addr start, Addr length,
+                                 uint32_t owner_gpu_id, Addr paddr,
+                                 int pool_id)
 {
     AddrRange range = AddrRange(start, start + length);
     DPRINTF(GPUDriver, "Registering [%p - %p] with MTYPE %d\n",
             range.start(), range.end(), mtype);
     fatal_if(gpuVmas.insert(range, mtype) == gpuVmas.end(),
              "Attempted to double register Mtypes for [%p - %p]\n",
+             range.start(), range.end());
+    GpuVmaInfo info;
+    info.mtype = mtype;
+    info.ownerGpuId = owner_gpu_id;
+    info.paddr = paddr;
+    info.size = length;
+    info.poolId = pool_id;
+    info.mappedGpuIds.insert(owner_gpu_id);
+    fatal_if(gpuVmaInfo.insert(range, info) == gpuVmaInfo.end(),
+             "Attempted to double register GPU VMA info for [%p - %p]\n",
              range.start(), range.end());
 }
 
@@ -980,25 +1153,88 @@ GPUComputeDriver::deallocateGpuVma(Addr start)
     DPRINTF(GPUDriver, "Unregistering [%p - %p]\n", vma->first.start(),
             vma->first.end());
     gpuVmas.erase(vma);
+    auto info = gpuVmaInfo.contains(start);
+    if (info != gpuVmaInfo.end()) {
+        gpuVmaInfo.erase(info);
+    }
     return size;
 }
 
 void
-GPUComputeDriver::setMtype(RequestPtr req)
+GPUComputeDriver::setMtype(RequestPtr req,
+                           const GPUCommandProcessor *requestor)
 {
     // If we are a dGPU then set the MTYPE from our VMAs.
     if (isdGPU) {
         assert(!FullSystem);
         AddrRange range = RangeSize(req->getVaddr(), req->getSize());
-        auto vma = gpuVmas.contains(range);
-        assert(vma != gpuVmas.end());
-        DPRINTF(GPUShader, "Setting req from [%p - %p] MTYPE %d\n"
-                "%d\n", range.start(), range.end(), vma->second);
-        req->setCacheCoherenceFlags(vma->second);
+        auto vma = gpuVmaInfo.contains(range);
+        assert(vma != gpuVmaInfo.end());
+        const uint32_t requestor_gpu_id = gpuIdForDevice(requestor);
+        fatal_if(!vma->second.mappedGpuIds.count(requestor_gpu_id),
+                 "GPU %d attempted to access unmapped GPU VMA [%p - %p] "
+                 "owned by GPU %d\n",
+                 requestor_gpu_id, range.start(), range.end(),
+                 vma->second.ownerGpuId);
+        DPRINTF(GPUShader, "Setting req from [%p - %p] MTYPE %d for GPU %d\n",
+                range.start(), range.end(), vma->second.mtype,
+                requestor_gpu_id);
+        req->setCacheCoherenceFlags(vma->second.mtype);
     // APUs always get the default MTYPE
     } else {
         req->setCacheCoherenceFlags(defaultMtype);
     }
+}
+
+GPUCommandProcessor&
+GPUComputeDriver::deviceForGpuId(uint32_t gpu_id)
+{
+    auto it = gpuIdToDeviceIdx.find(gpu_id);
+    fatal_if(it == gpuIdToDeviceIdx.end(),
+             "%s received unknown gpu_id %d\n", name(), gpu_id);
+    return *devices[it->second];
+}
+
+GPUCommandProcessor&
+GPUComputeDriver::deviceForQueueId(uint32_t queue_id)
+{
+    auto it = queueIdToDeviceIdx.find(queue_id);
+    fatal_if(it == queueIdToDeviceIdx.end(),
+             "%s received unknown queue_id %d\n", name(), queue_id);
+    return *devices[it->second];
+}
+
+uint32_t
+GPUComputeDriver::gpuIdForDevice(const GPUCommandProcessor *requestor) const
+{
+    auto it = deviceToGpuId.find(requestor);
+    fatal_if(it == deviceToGpuId.end(),
+             "%s received request from an unmanaged GPU command processor\n",
+             name());
+    return it->second;
+}
+
+int
+GPUComputeDriver::vramPoolForGpuId(uint32_t gpu_id) const
+{
+    auto it = gpuIdToDeviceIdx.find(gpu_id);
+    fatal_if(it == gpuIdToDeviceIdx.end(),
+             "%s received unknown gpu_id %d\n", name(), gpu_id);
+    return vramPoolIds[it->second];
+}
+
+uint32_t
+GPUComputeDriver::mmapGpuId(Addr pg_off) const
+{
+    uint32_t gpu_id = (pg_off & KFD_MMAP_GPU_ID_MASK) >>
+        KFD_MMAP_GPU_ID_SHIFT;
+    if (gpuIdToDeviceIdx.count(gpu_id)) {
+        return gpu_id;
+    }
+    fatal_if(devices.size() != 1,
+             "%s doorbell mmap offset does not encode a known gpu_id: %#x\n",
+             name(), gpu_id);
+    return deviceToGpuId.at(devices.front());
 }
 
 } // namespace gem5

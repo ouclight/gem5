@@ -48,6 +48,7 @@ machine(MachineType:Directory, "AMD Baseline protocol")
   bool noTCCdir := "False";
   bool CAB_TCC := "False";
   int TCC_select_num_bits:=1;
+  int TCC_select_cluster_id := 0;
   bool useL3OnWT := "False";
   bool inclusiveDir := "True";
   Cycles to_memory_controller_latency := 1;
@@ -668,9 +669,11 @@ machine(MachineType:Directory, "AMD Baseline protocol")
           // Don't Include TCCs unless there was write-CAB conflict in the TCC
           } else if(noTCCdir) {
             out_msg.Destination.add(mapAddressToRange(address,MachineType:TCC,
-                                    TCC_select_low_bit, TCC_select_num_bits));
+                                    TCC_select_low_bit, TCC_select_num_bits,
+                                    intToID(TCC_select_cluster_id)));
           } else {
-                out_msg.Destination.add(mapAddressToMachine(address, MachineType:TCCdir));
+                out_msg.Destination.add(createMachineID(MachineType:TCCdir,
+                                                        intToID(TCC_select_cluster_id)));
           }
         }
         out_msg.Destination.remove(in_msg.Requestor);
@@ -704,12 +707,14 @@ machine(MachineType:Directory, "AMD Baseline protocol")
         if (noTCCdir) {
           //Don't need to notify TCC about reads
         } else {
-          out_msg.Destination.add(mapAddressToMachine(address, MachineType:TCCdir));
+          out_msg.Destination.add(createMachineID(MachineType:TCCdir,
+                                                  intToID(TCC_select_cluster_id)));
           tbe.NumPendingAcks := tbe.NumPendingAcks + 1;
         }
         if (noTCCdir && CAB_TCC) {
           out_msg.Destination.add(mapAddressToRange(address,MachineType:TCC,
-                                  TCC_select_low_bit, TCC_select_num_bits));
+                                  TCC_select_low_bit, TCC_select_num_bits,
+                                  intToID(TCC_select_cluster_id)));
         }
       }
       tbe.NumPendingAcks := out_msg.Destination.count();
@@ -742,12 +747,14 @@ machine(MachineType:Directory, "AMD Baseline protocol")
           if (noTCCdir) {
             //Don't need to notify TCC about reads
           } else {
-            out_msg.Destination.add(mapAddressToMachine(address, MachineType:TCCdir));
+            out_msg.Destination.add(createMachineID(MachineType:TCCdir,
+                                                    intToID(TCC_select_cluster_id)));
             tbe.NumPendingAcks := tbe.NumPendingAcks + 1;
           }
           if (noTCCdir && CAB_TCC) {
             out_msg.Destination.add(mapAddressToRange(address,MachineType:TCC,
-                                    TCC_select_low_bit, TCC_select_num_bits));
+                                    TCC_select_low_bit, TCC_select_num_bits,
+                                    intToID(TCC_select_cluster_id)));
           }
         }
         out_msg.Destination.remove(in_msg.Requestor);
@@ -781,9 +788,11 @@ machine(MachineType:Directory, "AMD Baseline protocol")
         if(isGPUSharer(address)) {
           if (noTCCdir) {
               out_msg.Destination.add(mapAddressToRange(address,MachineType:TCC,
-                                TCC_select_low_bit, TCC_select_num_bits));
+                                TCC_select_low_bit, TCC_select_num_bits,
+                                intToID(TCC_select_cluster_id)));
           } else {
-              out_msg.Destination.add(mapAddressToMachine(address, MachineType:TCCdir));
+              out_msg.Destination.add(createMachineID(MachineType:TCCdir,
+                                                      intToID(TCC_select_cluster_id)));
           }
         }
         out_msg.Destination.remove(in_msg.Requestor);

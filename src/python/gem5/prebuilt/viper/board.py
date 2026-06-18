@@ -255,11 +255,17 @@ class ViperBoard(X86Board):
         same, if there's more that one GPU.
         """
 
-        if self.get_devices() is None:
+        if not self.get_devices():
             warn("No GPU devices. Not loading GPU driver.")
             return super()._set_readfile_contents(readfile_contents)
 
-        driver_load_command = self.get_devices()[0].get_driver_command()
+        devices = self.get_devices()
+        vbios_commands = "".join(
+            gpu.get_vbios_command() for gpu in devices[1:]
+        )
+        driver_load_command = (
+            vbios_commands + devices[0].get_driver_command()
+        )
         contents = driver_load_command + "\n" + readfile_contents
 
         return super()._set_readfile_contents(contents)

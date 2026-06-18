@@ -42,6 +42,7 @@ class BaseViperGPU(SubSystem):
     _base_pci_dev = 8
     _gpu_count = 0
     _my_id = 0
+    _default_expansion_rom = 0xC0000
 
     @classmethod
     def next_pci_dev(cls):
@@ -73,6 +74,28 @@ class BaseViperGPU(SubSystem):
 
     def get_cpu_dma_ports(self):
         return self.shader.get_cpu_dma_ports()
+
+    def get_vbios_path(self) -> str:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must define a VBIOS path"
+        )
+
+    def get_vbios_command(self) -> str:
+        expansion_rom = self.device.ExpansionROM
+        if expansion_rom == 0:
+            expansion_rom = self._default_expansion_rom
+
+        if expansion_rom % 1024 != 0:
+            raise ValueError(
+                "GPU ExpansionROM must be 1KiB aligned to generate a "
+                "guest dd command"
+            )
+
+        seek = expansion_rom // 1024
+        return (
+            f"dd if={self.get_vbios_path()} of=/dev/mem "
+            f"bs=1k seek={seek} count=128\n"
+        )
 
     def connectGPU(self, board: "ViperBoard") -> None:
         # Connect a CPU pointer. This is only used for SE mode. Any CPU will
@@ -184,7 +207,7 @@ class MI210(BaseViperGPU):
             "export HSA_ENABLE_INTERRUPT=0\n"
             "export HCC_AMDGPU_TARGET=gfx90a\n"
             f"{debug_commands}\n"
-            "dd if=/root/roms/mi200.rom of=/dev/mem bs=1k seek=768 count=128\n"
+            f"{self.get_vbios_command()}"
             "if [ -f /home/gem5/load_amdgpu.sh ]; then\n"
             "    sh /home/gem5/load_amdgpu.sh\n"
             "elif [ ! -f /lib/modules/`uname -r`/updates/dkms/amdgpu.ko ]; then\n"
@@ -196,6 +219,9 @@ class MI210(BaseViperGPU):
         )
 
         return driver_load_command
+
+    def get_vbios_path(self) -> str:
+        return "/root/roms/mi200.rom"
 
 
 # Defaults to a single "XCD" (i.e., 1/8th of a full MI300X).
@@ -302,7 +328,7 @@ class MI300X(BaseViperGPU):
             "export HSA_ENABLE_INTERRUPT=0\n"
             "export HCC_AMDGPU_TARGET=gfx942\n"
             f"{debug_commands}\n"
-            "dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128\n"
+            f"{self.get_vbios_command()}"
             # Check if exists (backwards compat with ROCm <7.0)
             "if [ -e /usr/lib/firmware/amdgpu/mi300_discovery ]; then\n"
             "    rm -f /usr/lib/firmware/amdgpu/ip_discovery.bin\n"
@@ -319,6 +345,9 @@ class MI300X(BaseViperGPU):
         )
 
         return driver_load_command
+
+    def get_vbios_path(self) -> str:
+        return "/root/roms/mi300.rom"
 
 
 # Defaults to a single "XCD" (i.e., 1/8th of a full MI355X).
@@ -365,7 +394,7 @@ class MI355X(MI300X):
             "export HSA_ENABLE_INTERRUPT=0\n"
             "export HCC_AMDGPU_TARGET=gfx950\n"
             f"{debug_commands}\n"
-            "dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128\n"
+            f"{self.get_vbios_command()}"
             "if [ -e /usr/lib/firmware/amdgpu/mi350_discovery ]; then\n"
             "    rm -f /usr/lib/firmware/amdgpu/ip_discovery.bin\n"
             "    ln -s /usr/lib/firmware/amdgpu/mi350_discovery /usr/lib/firmware/amdgpu/ip_discovery.bin\n"

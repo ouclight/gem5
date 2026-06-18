@@ -40,6 +40,7 @@ machine(MachineType:RegionDir, "Region Directory for AMD_Base-like protocol")
   bool asym_migrate := "False";
   bool noTCCdir := "False";
   int TCC_select_num_bits := 1;
+  int TCC_select_cluster_id := 0;
 
   // To the directory
   MessageBuffer * requestToDir, network="To", virtual_network="5", vnet_type="request";
@@ -181,9 +182,11 @@ machine(MachineType:RegionDir, "Region Directory for AMD_Base-like protocol")
     } else if (machineIDToNodeID(rBuf) == gpuRegionBufferNum) {
       if (noTCCdir) {
         return mapAddressToRange(address,MachineType:TCC,
-                                    TCC_select_low_bit, TCC_select_num_bits);
+                                    TCC_select_low_bit, TCC_select_num_bits,
+                                    intToID(TCC_select_cluster_id));
       } else {
-        return createMachineID(MachineType:TCCdir, intToID(0));
+        return createMachineID(MachineType:TCCdir,
+                               intToID(TCC_select_cluster_id));
       }
     } else {
       error("Unexpected region buffer number");

@@ -65,16 +65,16 @@ class SimplePt2Pt(SimpleNetwork):
 
         # Make an "internal" link (internal to the network) between every pair
         # of routers.
-        link_count = 0
+        link_count = len(self.ext_links)
         int_links = []
         for ri in self.routers:
             for rj in self.routers:
                 if ri == rj:
                     continue  # Don't connect a router to itself!
-                link_count += 1
                 int_links.append(
                     SimpleIntLink(link_id=link_count, src_node=ri, dst_node=rj)
                 )
+                link_count += 1
         self.int_links = int_links
 
 

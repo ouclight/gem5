@@ -42,6 +42,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <vector>
 #include <set>
 #include <unordered_map>
 
@@ -80,7 +81,7 @@ class GPUComputeDriver final : public EmulatedDriver
      * isn't the best way to proceed.  For now we just have the driver set
      * these until we implement a proper dual PT system.
      */
-    void setMtype(RequestPtr req);
+    void setMtype(RequestPtr req, const GPUCommandProcessor *requestor);
 
     int
     doorbellSize()
@@ -147,7 +148,12 @@ class GPUComputeDriver final : public EmulatedDriver
      * GPU that is controlled by this driver.
      */
     GPUCommandProcessor *device;
+    std::vector<GPUCommandProcessor *> devices;
+    std::unordered_map<uint32_t, uint32_t> gpuIdToDeviceIdx;
+    std::unordered_map<const GPUCommandProcessor *, uint32_t> deviceToGpuId;
+    std::vector<int> vramPoolIds;
     uint32_t queueId;
+    std::unordered_map<uint32_t, uint32_t> queueIdToDeviceIdx;
     bool isdGPU;
     GfxVersion gfxVersion;
     int dGPUPoolID;
@@ -160,6 +166,17 @@ class GPUComputeDriver final : public EmulatedDriver
      * VMA structures for GPUVM memory.
      */
     AddrRangeMap<Request::CacheCoherenceFlags, 1> gpuVmas;
+
+    struct GpuVmaInfo
+    {
+        Request::CacheCoherenceFlags mtype;
+        uint32_t ownerGpuId;
+        Addr paddr;
+        Addr size;
+        int poolId;
+        std::set<uint32_t> mappedGpuIds;
+    };
+    AddrRangeMap<GpuVmaInfo, 1> gpuVmaInfo;
 
     /**
      * Mtype bits {Cached, Read Write, Shared} for caches
@@ -242,10 +259,16 @@ class GPUComputeDriver final : public EmulatedDriver
      * a handle during the free ioctl.
      */
     void allocateGpuVma(Request::CacheCoherenceFlags mtype, Addr start,
-                        Addr length);
+                        Addr length, uint32_t owner_gpu_id, Addr paddr,
+                        int pool_id);
     Addr deallocateGpuVma(Addr start);
 
     void allocateQueue(PortProxy &mem_proxy, Addr ioc_buf_addr);
+    GPUCommandProcessor& deviceForGpuId(uint32_t gpu_id);
+    GPUCommandProcessor& deviceForQueueId(uint32_t queue_id);
+    uint32_t gpuIdForDevice(const GPUCommandProcessor *requestor) const;
+    int vramPoolForGpuId(uint32_t gpu_id) const;
+    uint32_t mmapGpuId(Addr pg_off) const;
 
 };
 
