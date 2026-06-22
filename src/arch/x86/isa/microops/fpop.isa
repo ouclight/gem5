@@ -310,6 +310,29 @@ let {{
         code = 'FpDestReg = tan(FpSrcReg1);'
         op_class = 'FloatSqrtOp'
 
+    class Roundfp(FpOp):
+        operand_types = (FloatDestOp, FloatSrc1Op, IntSrc2Op)
+
+        def __init__(self, reg1, reg2, reg3, **kwargs):
+            super().__init__(reg1, reg2, reg3, **kwargs)
+
+        code = '''
+            switch (bits(SrcReg2, 11, 10)) {
+              case 0:
+                FpDestReg = std::nearbyint(FpSrcReg1);
+                break;
+              case 1:
+                FpDestReg = std::floor(FpSrcReg1);
+                break;
+              case 2:
+                FpDestReg = std::ceil(FpSrcReg1);
+                break;
+              case 3:
+                FpDestReg = std::trunc(FpSrcReg1);
+                break;
+            }
+        '''
+        op_class = 'FloatCvtOp'
 
     # Conversion microops
     class ConvOp(Fp2Op):

@@ -100,7 +100,7 @@ format WarnUnimpl {
                     0x1: fyl2xp1();
                     0x2: fsqrt();
                     0x3: Inst::FSINCOS();
-                    0x4: frndint();
+                    0x4: Inst::FRNDINT();
                     0x5: fscale();
                     0x6: Inst::FSIN();
                     0x7: Inst::FCOS();

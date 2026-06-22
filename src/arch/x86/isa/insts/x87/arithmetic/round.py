@@ -34,5 +34,8 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 microcode = """
-# FRNDINT
+def macroop FRNDINT {
+    rdval t1, fcw
+    roundfp st(0), st(0), t1
+};
 """
