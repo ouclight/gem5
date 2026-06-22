@@ -2000,3 +2000,1463 @@ Verification completed:
 
 Next diagnostic step: the user rebuilds `build/VEGA_X86/gem5.opt`, then reruns
 the same invalidation simulation command without broad Ruby debug flags.
+
+### Invalidation Rerun Reaches Ignored clock_nanosleep
+
+After rebuilding gem5, the rerun passed the previous fatal point. The first
+relevant changed result was:
+
+```text
+src/sim/syscall_emul.cc:97:
+warn: ignoring syscall clock_nanosleep(...)
+```
+
+The output still stopped inside:
+
+```text
+[peer_invalidate] begin hsa_executable_freeze(executable, nullptr)
+```
+
+No `phase 1: GPU1 write A`, Ruby failure, result classification, or gem5 exit
+cause was observed. The process was no longer running when inspected, and
+`m5out-invalidate/stats.txt` was empty, so this capture cannot establish
+whether the runtime was permanently deadlocked or manually stopped while
+making slow progress.
+
+The hypothesis that the one-line ignore handler is sufficient is not yet
+accepted. Ignoring a sleep used as a ROCm helper-thread polling backoff may
+alter thread scheduling under TimingSimpleCPU.
+
+No source file was changed during this result inspection.
+
+Next diagnostic step: run the already validated `xgmi-peer-vram` binary with
+the same rebuilt `gem5.opt` and normal kernel-launch acquire settings. Compare
+whether it completes `hsa_executable_freeze`. Do not add Ruby tracing yet,
+because the run has not reached a GPU request phase.
+
+### Peer-VRAM Control Run Passed
+
+The user reran the established `xgmi-peer-vram` workload with the same rebuilt
+`gem5.opt`, and it completed normally. This rejects the hypothesis that the
+new `clock_nanosleep` ignore handler generally prevents ROCm executable freeze
+or kernel execution.
+
+Read-only HSACO comparison confirmed that both code objects are valid gfx900
+AMDGPU ELF files using metadata version `[1, 0]`. Their sizes and ABI structure
+are nearly identical. The main structural difference is:
+
+- passing peer-VRAM HSACO: two kernel symbols;
+- blocked invalidation HSACO: three kernel symbols (`write_value`,
+  `read_value`, and `classify_value`).
+
+The ROCm 4 `llvm-objdump` binary cannot disassemble either gfx900 object and
+aborts with `Disassembly not yet supported for subtarget`; this tool limitation
+does not distinguish the two HSACOs. `llvm-readelf` successfully read both
+objects and found no malformed metadata.
+
+Accepted facts:
+
+- the block remains before any GPU kernel dispatch or Ruby request;
+- it is specific to the new code object or its loader path;
+- broad Ruby tracing would not provide useful evidence yet.
+
+Next diagnostic step: reduce the invalidation HSACO from three kernel symbols
+to two by replacing `read_value` and `classify_value` with one parameterized
+`observe_value` kernel. Preserve the four host-sequenced phases and result
+classification, rebuild only the diagnostic binary, and rerun without Ruby
+debug flags.
+
+### Project Priority Shift: ROCm HIP API Compatibility
+
+The immediate project priority has changed from the peer-invalidation
+microbenchmark to reusable ROCm API support for diverse applications on the
+SE multi-GPU platform.
+
+The first milestone is a single-GPU, public-HIP-only smoke program with
+cumulative stages:
+
+```text
+malloc -> memset -> memcpy -> launch -> lifecycle
+```
+
+The program must not use raw HSA dispatch, direct mapped-device reads, or m5
+pseudo-operation exits. Every API has begin/end markers and every data
+operation has host-side validation.
+
+Acceptance is split into:
+
+- API completion: the target API returns and its data validation passes;
+- lifecycle completion: `hipFree` returns and the program exits normally.
+
+This separation prevents an SE `exit_group` issue from being mistaken for a
+HIP API failure.
+
+Files changed:
+
+- `docs/superpowers/specs/2026-06-20-se-rocm-hip-api-smoke-design.md`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- design checked against the existing peer-VRAM workarounds and known
+  `hipMemcpy`, `hipFree`, ROCm teardown, and process-exit blockers;
+- no test program, gem5 source, build, or simulation was changed or started.
+
+Next step: user review of the HIP API smoke-test specification, followed by an
+implementation plan.
+
+### HIP API Smoke Implementation Plan Prepared
+
+The approved design is now decomposed into:
+
+1. a failing source contract;
+2. one public-HIP `.hip` program with five cumulative stages;
+3. a direct ROCm 4 gfx900 Makefile without HSA or m5ops;
+4. focused and complete lightweight verification;
+5. a user-owned build and ordered runtime matrix.
+
+The later stages strictly rerun earlier API validations before adding the next
+layer. Non-lifecycle stages intentionally do not call `hipFree`, so allocation,
+data operations, and launch completion can be distinguished from teardown.
+
+Files changed:
+
+- `docs/superpowers/plans/2026-06-20-se-rocm-hip-api-smoke.md`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- plan checked against every design requirement;
+- no placeholders or unresolved implementation decisions remain;
+- no test source, gem5 source, build, or simulation was changed or started.
+
+Next step: execute the written plan, beginning with the focused RED source
+regression.
+
+### Public HIP API Smoke Program Implemented
+
+The single-GPU public-HIP compatibility program was added under:
+
+- `tests/test-progs/gpu/hip-api-smoke/hip_api_smoke.hip`
+- `tests/test-progs/gpu/hip-api-smoke/Makefile`
+
+It accepts cumulative stages:
+
+```text
+malloc
+memset
+memcpy
+launch
+lifecycle
+```
+
+The program uses normal HIP APIs and `<<<...>>>` kernel launch syntax. It does
+not include raw HSA APIs, direct mapped-device reads, or gem5 pseudo
+instructions. Every HIP call emits begin/end markers, and every data-producing
+stage validates all 256 output words.
+
+The focused source contract first failed with:
+
+```text
+FileNotFoundError:
+tests/test-progs/gpu/hip-api-smoke/hip_api_smoke.hip
+```
+
+After implementation, commands run were:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -p tests/pyunit/stdlib \
+  -m unittest \
+  test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_api_smoke_uses_public_hip_cumulative_stages
+```
+
+```bash
+make -n -C tests/test-progs/gpu/hip-api-smoke \
+  ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc
+```
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -p tests/pyunit/stdlib \
+  -m unittest test_se_viper_multigpu
+```
+
+```bash
+git diff --check
+```
+
+Results:
+
+```text
+Ran 1 test in 0.000s
+OK
+
+Ran 16 tests in 0.014s
+OK
+```
+
+The Makefile dry run expanded to one direct command with separate
+`-mno-code-object-v3`, `-O2`, and `--offload-arch=gfx900` arguments. It did not
+link HSA runtime libraries or m5ops.
+
+Facts confirmed:
+
+- stages are cumulative and ordered;
+- non-lifecycle stages intentionally omit `hipFree`;
+- the lifecycle stage runs the launch workload, then calls `hipFree`, prints
+  `LIFECYCLE_PASSED`, and returns zero;
+- memset, round-trip copy, and kernel transformation have full host-side data
+  validation;
+- no build artifacts were generated by Codex.
+
+Files changed:
+
+- `tests/test-progs/gpu/hip-api-smoke/hip_api_smoke.hip`
+- `tests/test-progs/gpu/hip-api-smoke/Makefile`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- `docs/superpowers/specs/2026-06-20-se-rocm-hip-api-smoke-design.md`
+- `docs/superpowers/plans/2026-06-20-se-rocm-hip-api-smoke.md`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- focused source contract passed;
+- complete lightweight SE multi-GPU suite passed: 16 tests;
+- `git diff --check` passed;
+- Makefile dry run passed;
+- HIP binary was not built and no simulation was started.
+
+User-owned build command:
+
+```bash
+make -C tests/test-progs/gpu/hip-api-smoke \
+  ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc
+```
+
+Ordered runtime matrix:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -d m5out-hip-malloc \
+  --listener-mode=off \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py \
+  --cpu-type timing \
+  --app tests/test-progs/gpu/hip-api-smoke/hip_api_smoke \
+  --opts="--stage malloc" \
+  --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1
+```
+
+After `API_STAGE_PASSED stage=malloc`, repeat with the stage and output
+directory changed in order to:
+
+```text
+memset
+memcpy
+launch
+lifecycle
+```
+
+Do not pass `--disable-gpu0-kernel-launch-acquire`; this matrix tests normal
+HIP runtime behavior. Stop at the first stage without its expected pass marker.
+
+Next diagnostic step: the user builds `hip_api_smoke`, then runs only the
+`malloc` stage.
+
+### HIP API Smoke Binary Built
+
+The user-owned `hip_api_smoke` build completed successfully. Read-only artifact
+inspection confirmed:
+
+- the binary timestamp is newer than `hip_api_smoke.hip`;
+- it is a valid x86-64 ELF executable;
+- it contains all five stage names and both pass markers;
+- it contains the registered `transform_kernel` device symbol and host stub;
+- it does not define gem5 m5ops or raw HSA symbols.
+
+No source file was changed during artifact inspection.
+
+Next diagnostic step: run only `--stage malloc` with normal kernel-launch
+acquire settings and no broad Ruby debug flags. Do not run later stages until
+`API_STAGE_PASSED stage=malloc` is observed.
+
+### Public HIP malloc Stage Passed
+
+The user-owned `malloc` stage completed successfully.
+
+The command was:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -d m5out-hip-malloc \
+  --listener-mode=off \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py \
+  --cpu-type timing \
+  --app tests/test-progs/gpu/hip-api-smoke/hip_api_smoke \
+  --opts="--stage malloc" \
+  --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1
+```
+
+The first relevant final result was:
+
+```text
+[hip_api_smoke] begin hipMalloc(device_data, bytes)
+[hsaKmtAllocMemory] node 1
+[hsaKmtMapMemoryToGPUNodes] address 0x7ffdee800000 number of nodes 1
+[hip_api_smoke] end hipMalloc(device_data, bytes)
+API_STAGE_PASSED stage=malloc
+Exiting @ tick 45711472770 because exiting with last active thread context.
+```
+
+Facts confirmed:
+
+- public HIP runtime initialization completed with two enumerated GPU nodes;
+- `hipSetDevice(0)` completed;
+- `hipMalloc` allocated and mapped memory on KFD node 1;
+- the API pass marker was printed;
+- the process returned normally without `m5_exit`, ROCm teardown stalls, or a
+  `TimingSimpleCPU::suspendContext()` assertion.
+
+The warnings for `AMDKFD_IOC_SET_SCRATCH_BACKING_VA`,
+`AMDKFD_IOC_SET_TRAP_HANDLER`, and `AMDKFD_IOC_GET_TILE_CONFIG` did not block
+this stage. They remain compatibility gaps to revisit only if a later API
+requires their semantics.
+
+No source file was changed during result inspection.
+
+Next diagnostic step: run only the cumulative `memset` stage without broad Ruby
+debug flags. Stop at the first unmatched HIP begin marker or data-validation
+failure.
+
+### Public HIP memset Stage Blocked by FRNDINT
+
+The cumulative `memset` stage reached:
+
+```text
+[hip_api_smoke] begin hipMemset(device_data, memset_byte, bytes)
+```
+
+but did not print the matching `end` marker. The first relevant unsupported
+operation was:
+
+```text
+build/VEGA_X86/arch/x86/generated/exec-ns.cc.inc:
+warn: instruction 'frndint' unimplemented
+```
+
+No `hipDeviceSynchronize`, D2H copy, data validation, GPU kernel completion, or
+Ruby protocol failure was reached. Therefore the current blocker is in the
+ROCm CPU-side memset/runtime preparation path, before the public HIP call
+returns.
+
+Root-cause inspection found:
+
+- x86 decoding already routes opcode `FRNDINT`;
+- `src/arch/x86/isa/insts/x87/arithmetic/round.py` contained only an empty
+  comment placeholder;
+- generated gem5 code consequently used `WarnUnimplemented`, effectively
+  treating the required x87 operation as a no-op.
+
+A `roundfp` micro-op and `FRNDINT` macroop were added. The implementation reads
+x87 FCW bits `[11:10]` and applies:
+
+- nearest-even with `std::nearbyint`;
+- down with `std::floor`;
+- up with `std::ceil`;
+- toward zero with `std::trunc`.
+
+The focused regression first failed against the empty placeholder, then passed
+after implementation.
+
+Commands:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -p tests/pyunit/stdlib \
+  -m unittest \
+  test_se_viper_multigpu.SEViperMultiGPUTest.test_x86_frndint_uses_fcw_rounding_mode
+```
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -p tests/pyunit/stdlib \
+  -m unittest test_se_viper_multigpu
+```
+
+```bash
+python3 -m py_compile \
+  src/arch/x86/isa/insts/x87/arithmetic/round.py
+```
+
+```bash
+git diff --check
+```
+
+Results:
+
+```text
+Ran 1 test in 0.000s
+OK
+
+Ran 17 tests in 0.014s
+OK
+```
+
+Files changed:
+
+- `src/arch/x86/isa/microops/fpop.isa`
+- `src/arch/x86/isa/insts/x87/arithmetic/round.py`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- focused source regression passed;
+- complete lightweight suite passed: 17 tests;
+- Python syntax and `git diff --check` passed;
+- gem5 was not rebuilt and the instruction has not yet been executed.
+
+Next diagnostic step: the user rebuilds `build/VEGA_X86/gem5.opt`, then reruns
+the same `--stage memset` command without Ruby debug flags.
+
+### FRNDINT Decoder Wiring Corrected
+
+After the first FRNDINT implementation build, the `memset` rerun showed no
+behavior change and still printed:
+
+```text
+warn: instruction 'frndint' unimplemented
+```
+
+Generated-source inspection showed that `Roundfp` classes were present, but
+the decoder still returned `WarnUnimplemented("frndint", ...)`.
+
+The x87 decoder is enclosed in `format WarnUnimpl`; implemented instructions
+must explicitly use the `Inst::` format. FRNDINT still used:
+
+```text
+0x4: frndint();
+```
+
+and therefore never selected the generated macroop. The decoder is corrected
+to:
+
+```text
+0x4: Inst::FRNDINT();
+```
+
+The strengthened regression first failed against the missing decoder
+connection and then passed.
+
+Files changed:
+
+- `src/arch/x86/isa/decoder/x87.isa`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- focused FRNDINT source regression passed;
+- complete lightweight suite passed: 17 tests;
+- Python syntax and `git diff --check` passed;
+- the current `gem5.opt` still contains the old generated decoder until the
+  next rebuild.
+
+Next diagnostic step: the user rebuilds `build/VEGA_X86/gem5.opt` again, checks
+that generated decode code no longer contains
+`WarnUnimplemented("frndint", ...)`, and reruns `--stage memset`.
+
+### FRNDINT Executes but HIP memset Still Does Not Return
+
+After rebuilding with the decoder correction, generated code now contains:
+
+```text
+return new x86_macroop::FRNDINT(...)
+```
+
+and no longer contains `WarnUnimplemented("frndint", ...)`. The rerun also
+contains no `frndint unimplemented` warning, confirming that the instruction
+implementation is active.
+
+The run still stopped after:
+
+```text
+[hip_api_smoke] begin hipMemset(device_data, memset_byte, bytes)
+```
+
+without reaching the matching end marker. The remaining output consists mainly
+of ignored `mprotect` calls, with one `MOVNTDQ` non-temporal-hint warning. No
+`hipDeviceSynchronize`, D2H copy, data validation, GPU completion event, Ruby
+failure, or exit cause was observed.
+
+Accepted conclusions:
+
+- FRNDINT was a real missing instruction, but it was not sufficient to make
+  `hipMemset` complete;
+- the first blocked public API remains `hipMemset`;
+- repeated `mprotect` warnings alone do not prove that ignored protection
+  semantics are the cause, because ignored `mprotect` also occurs in passing
+  ROCm paths;
+- this Timing CPU run may be executing a very slow ROCm CPU-side internal
+  kernel/runtime initialization path.
+
+No source file was changed during this result inspection.
+
+Next diagnostic step: run the same `--stage memset` workload with
+`--cpu-type kvm` in a new output directory. If KVM passes, classify the blocker
+as Timing CPU runtime compatibility/performance before changing KFD or GPU
+logic. If KVM also fails at the same marker, investigate ROCm runtime/KFD
+semantics next. Do not modify `mprotect` based only on warning frequency.
+
+### HIP memset Has Not Reached GPU Memory Execution
+
+The interrupted `memset` run was inspected using:
+
+```bash
+wc -l m5out-hip-memset/stdout.txt m5out-hip-memset/stderr.txt
+tail -n 120 m5out-hip-memset/stdout.txt
+tail -n 160 m5out-hip-memset/stderr.txt
+```
+
+```bash
+rg -n \
+  '^board\.gpus0\..*(num.*(Inst|Wg|Wave|Kernel|Dispatch)|executed|completed)' \
+  m5out-hip-memset/stats.txt
+```
+
+```bash
+rg -n -i \
+  'sdma|gpu.*(kernel|dispatch|queue|request|response|read|write)|simTicks|simInsts' \
+  m5out-hip-malloc/stats.txt m5out-hip-memset/stats.txt
+```
+
+```bash
+strings \
+  .deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/lib/libamdhip64.so.4.0.40001 \
+  | rg -i 'memset|fill|blit|HSA_ENABLE_SDMA'
+```
+
+The first relevant observable result is:
+
+```text
+Exiting @ tick 78056531667 because user interrupt received.
+```
+
+The run retired 69,256,091 CPU instructions before interruption, but all GPU
+execution and memory-operation counters remained zero:
+
+```text
+board.gpus0.CUs0.numInstrExecuted 0
+board.gpus0.CUs0.completedWGs 0
+board.gpus0.CUs0.globalMemInsts 0
+board.gpus0.CUs0.vectorMemWrites 0
+```
+
+The same zero result applies to every CU of both GPUs. GPU VRAM controller read
+and write bursts are also zero.
+
+The SE environment explicitly sets:
+
+```text
+HSA_ENABLE_SDMA=0
+```
+
+ROCm library inspection shows the non-SDMA fallback components
+`KernelBlitManager` and internal kernel `__amd_rocclr_fillBuffer`. Therefore
+this `hipMemset` is expected to create and dispatch an internal fill kernel,
+not issue an SDMA constant-fill packet.
+
+Facts confirmed:
+
+- no fill-kernel instruction or GPU memory write executed before interruption;
+- this is not currently evidence of a GPU memory request being sent and then
+  losing its Ruby or VRAM response;
+- the remaining boundary is before CU execution: either ROCm is still creating
+  the internal blit kernel, or it has submitted AQL work that the doorbell/HSA
+  packet processor has not consumed;
+- repeated CPU-side `mprotect` calls and the substantial CPU instruction count
+  are consistent with internal blit-kernel creation, but do not yet prove that
+  this is the exact stopping point.
+
+No source file was changed during this inspection.
+
+Next diagnostic step: rerun the Timing CPU `memset` stage with only
+`GPUDriver,HSAPacketProcessor,GPUCommandProc,GPUDisp,AMDGPUMem` tracing enabled
+from tick 45,000,000,000. Do not enable broad Ruby tracing. The last observed
+boundary will distinguish internal-kernel creation from an unconsumed AQL
+packet or a dispatched kernel waiting on memory.
+
+### Focused memset Trace Ends Before AQL Submission
+
+The focused trace run used:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -d m5out-hip-memset-trace \
+  --debug-start=45000000000 \
+  --debug-flags=GPUDriver,HSAPacketProcessor,GPUCommandProc,GPUDisp,AMDGPUMem \
+  --debug-file=hip-memset-gpu.trace \
+  --stdout-file=stdout.txt \
+  --stderr-file=stderr.txt \
+  --listener-mode=off \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py \
+  --cpu-type timing \
+  --app tests/test-progs/gpu/hip-api-smoke/hip_api_smoke \
+  --opts="--stage memset" \
+  --rocm-path \
+  /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1
+```
+
+Online inspection commands:
+
+```bash
+tail -n 80 m5out-hip-memset-trace/stdout.txt
+tail -n 120 m5out-hip-memset-trace/stderr.txt
+tail -n 160 m5out-hip-memset-trace/hip-memset-gpu.trace
+```
+
+```bash
+rg -n \
+  'submitting kernel dispatch pkt|launching kernel|Kernel.*completed|doorbell|AQL processing|Received Response' \
+  m5out-hip-memset-trace/hip-memset-gpu.trace
+```
+
+```bash
+test -d /proc/727225
+pgrep -a gem5.opt
+```
+
+The trace contains only 11 lines. Its last operation is:
+
+```text
+45374128119: ... ioctl: AMDKFD_IOC_MAP_MEMORY_TO_GPU
+45374128119: ... map target gpu_id 22124
+45374128119: ... map target gpu_id 22125
+```
+
+There is no compute-queue creation, doorbell activity, AQL processing, kernel
+dispatch, GPU command-processor activity, GPU memory request, or response.
+
+An initial process check incorrectly concluded that PID 727225 had exited.
+That check ran inside Codex's isolated PID namespace and cannot observe the
+user's host-side gem5 process. A subsequent five-second file-size check showed:
+
+```text
+stderr.txt: 29100 -> 29295 bytes
+hip-memset-gpu.trace: 1320 -> 1320 bytes
+```
+
+Therefore the simulation was still running and retiring CPU-side work.
+`stderr.txt` continued to add ignored `mprotect` warnings, while the focused
+GPU trace did not add any new KFD queue, AQL, dispatch, or memory activity.
+
+Facts confirmed:
+
+- the current failure remains before AQL/GPU submission;
+- the hypothesis of a GPU or Ruby memory request waiting for its response is
+  rejected for this capture;
+- the observed CPU-side work is in ROCm internal blit-kernel preparation and
+  memory setup;
+- the focused GPU trace cannot identify the exact CPU-side function where
+  progress is being spent;
+- host-process liveness must be inferred from user observation or output-file
+  growth, not from process inspection inside Codex's PID namespace.
+
+No source file was changed during inspection.
+
+Next diagnostic step: let the current run continue. Periodically compare the
+sizes of `stderr.txt` and `hip-memset-gpu.trace`. Stop only when the GPU trace
+records compute-queue/AQL activity, `hipMemset` returns, or CPU-side output
+ceases to advance for a sustained interval.
+
+### Long memset Run Confirms CPU-Side Activity Without GPU Submission
+
+The focused run was stopped normally with Ctrl-C. Post-run inspection used:
+
+```bash
+rg -n '^(simTicks|simInsts|hostSeconds|hostInstRate|hostTickRate)' \
+  m5out-hip-memset-trace/stats.txt
+```
+
+```bash
+rg -n \
+  '^board\.gpus[01]\.CUs[0-3]\.(numInstrExecuted|completedWGs|globalMemInsts|vectorMemWrites)' \
+  m5out-hip-memset-trace/stats.txt
+```
+
+```bash
+rg -n \
+  '^board\.gpu_memories[01]\.mem_ctrl\.(bytesReadSys|bytesWrittenSys|dram\.(readBursts|writeBursts))' \
+  m5out-hip-memset-trace/stats.txt
+```
+
+The exit and aggregate result were:
+
+```text
+Exiting @ tick 125420884569 because user interrupt received.
+hostSeconds 588.91
+simInsts 146562427
+```
+
+All GPU CU execution, workgroup completion, global-memory instructions, GPU
+VRAM bytes, and DRAM burst counters remained zero on both GPUs.
+
+Facts confirmed:
+
+- gem5 made substantial CPU-side progress for almost ten host minutes;
+- the recurring `mprotect` warnings are associated with continuing CPU work,
+  not a blocked GPU memory response;
+- no ROCm fill kernel was submitted or executed during 146 million simulated
+  CPU instructions;
+- waiting longer without CPU execution tracing is unlikely to add a new
+  diagnostic boundary.
+
+No source file was changed during result inspection.
+
+Next diagnostic step: rerun with a bounded `ExecEnable,ExecUser,ExecSymbol,
+ExecThread` sample from tick 120,000,000,000 through 120,010,000,000. Keep the
+existing focused GPU flags. Use a separate output directory and compressed
+debug file. The sample will identify the CPU symbol or address consuming time
+without generating an unbounded instruction trace.
+
+### First Bounded Exec Sample Stopped Before Its Window
+
+Post-run inspection command:
+
+```bash
+ls -lh m5out-hip-memset-exec
+rg -n '^(simTicks|simInsts|hostSeconds|hostInstRate)' \
+  m5out-hip-memset-exec/stats.txt
+gzip -cd m5out-hip-memset-exec/hip-memset-exec.trace.gz
+```
+
+The run ended with:
+
+```text
+Exiting @ tick 68665889709 because user interrupt received.
+```
+
+The requested debug window began at tick 120,000,000,000, so it was never
+reached. `hip-memset-exec.trace.gz` is a 20-byte empty gzip stream and contains
+no execution samples. This run does not provide new CPU-symbol evidence.
+
+No source file was changed during inspection.
+
+Next diagnostic step: repeat the bounded execution sample using tick
+60,000,000,000 through 60,010,000,000, which is below the previously observed
+termination point. Stop after the debug file has grown and then remained
+unchanged beyond the debug-end tick.
+
+### SE-Mode SDMA Feasibility Inspection
+
+Read-only inspection commands:
+
+```bash
+rg -n \
+  'SDMA|sdma|HSA_ENABLE_SDMA|CREATE_QUEUE|KFD_IOC_QUEUE_TYPE' \
+  src/python/gem5/prebuilt/viper/se_board.py \
+  src/python/gem5/components/devices/gpus/se_viper_gpu.py \
+  src/gpu-compute/gpu_compute_driver.cc \
+  src/dev/hsa src/dev/amdgpu
+```
+
+```bash
+sed -n '190,255p' src/gpu-compute/gpu_compute_driver.cc
+sed -n '145,240p' \
+  src/python/gem5/components/devices/gpus/se_viper_gpu.py
+sed -n '340,575p' src/dev/amdgpu/sdma_engine.cc
+```
+
+Facts confirmed:
+
+- gem5 already has an `SDMAEngine` model supporting important Vega packets,
+  including linear copy, write, fence, trap, atomic, and constant fill;
+- the current SE board explicitly exports `HSA_ENABLE_SDMA=0`;
+- `SEVegaGPU` instantiates only the HSA packet processor, GPU command
+  processor, dispatcher, and compute units; it does not instantiate an
+  `AMDGPUDevice`, `SDMAEngine`, PM4 processor, SDMA walker, or SDMA doorbell;
+- `GPUComputeDriver::allocateQueue()` logs `queue_type` but does not branch on
+  it. Every `AMDKFD_IOC_CREATE_QUEUE` is currently registered as an HSA compute
+  queue through `HSAPacketProcessor::setDeviceQueueDesc()`;
+- therefore changing only `HSA_ENABLE_SDMA=1` would expose a runtime path for
+  which the SE model has no correct queue ownership or doorbell routing.
+
+Accepted conclusion:
+
+- SDMA in SE mode is implementable by reusing packet execution logic from
+  `SDMAEngine`, but requires explicit SE integration rather than a
+  configuration switch.
+
+A minimum useful implementation would require:
+
+1. per-GPU SE SDMA engine instances and DMA/TLB connections;
+2. queue-type dispatch for `KFD_IOC_QUEUE_TYPE_SDMA` and
+   `KFD_IOC_QUEUE_TYPE_SDMA_XGMI`;
+3. SDMA queue descriptor and doorbell registration separate from the HSA
+   compute packet processor;
+4. SE-compatible virtual-address translation for host memory, local VRAM, and
+   peer VRAM;
+5. completion/fence signaling and queue destruction;
+6. focused packet tests for constant fill and linear copy before enabling
+   `HSA_ENABLE_SDMA=1`.
+
+No source file was changed during this inspection.
+
+The current HIP memset diagnosis remains independent: first complete the
+bounded CPU execution sample at ticks 60,000,000,000 through 60,010,000,000.
+SDMA support should be treated as a separate platform feature, not assumed to
+be the fix for the current CPU-side internal-kernel preparation issue.
+
+### 120B Exec Window Reached but Macro/Micro Trace Was Incomplete
+
+The reused `m5out-hip-memset-exec` directory now contains a later run that
+reached the requested trace window. Inspection commands:
+
+```bash
+nl -ba m5out-hip-memset-exec/hip-memset-exec.trace
+rg -n '^(simTicks|simInsts|hostSeconds|hostInstRate)' \
+  m5out-hip-memset-exec/stats.txt
+```
+
+```bash
+rg -n \
+  '^board\.processor\.cores[0-9]+\.core\.(commitStats0\.numInsts|numCycles)' \
+  m5out-hip-memset-exec/stats.txt
+```
+
+```bash
+rg -n \
+  '^board\.gpus[01]\.CUs[0-3]\.(numInstrExecuted|completedWGs|globalMemInsts|vectorMemWrites)' \
+  m5out-hip-memset-exec/stats.txt
+```
+
+The run completed by user interrupt at:
+
+```text
+simTicks 800385732748
+hostSeconds 4797.17
+simInsts 1249117409
+```
+
+After approximately 80 host minutes and 1.249 billion simulated CPU
+instructions, `hipMemset` still had not returned. Every GPU execution and VRAM
+request counter remained zero.
+
+The bounded trace contains only six lines, all on CPU core 1:
+
+```text
+0x7ffff7fcc3ef ... NOP
+0x7ffff7fcc427 ... NOP
+0x7ffff7fcdb6d ... NOP
+```
+
+The three PCs repeat. Symbolization reports them only as large offsets from
+`_end`, so the owning shared object is not identified. The trace flags included
+`ExecEnable`, `ExecUser`, `ExecSymbol`, and `ExecThread`, but omitted
+`ExecMacro` and `ExecMicro`. On x86 this omitted most macroop/microop execution,
+so the six NOP entries are not a representative instruction profile.
+
+CPU statistics show two runtime worker threads consuming nearly all execution:
+
+```text
+core 1: 583671014 instructions, 94.5 percent non-idle
+core 2: 640796468 instructions, 94.5 percent non-idle
+core 0:  24650767 instructions,  5.5 percent non-idle
+core 3:         0 instructions
+```
+
+There were 816 ignored `mprotect` calls. `stderr.txt` stopped growing well
+before the run ended, so the long final phase is dominated by two active CPU
+worker threads rather than continuing `mprotect` calls.
+
+Facts confirmed:
+
+- the runtime is not blocked waiting for a GPU/Ruby response;
+- two CPU-side worker threads are actively looping or performing work;
+- the current trace cannot identify their functions because x86 macroops and
+  microops were not enabled;
+- another long untraced wait is not useful.
+
+No source file was changed during inspection.
+
+Next diagnostic step: repeat only a short reachable window with
+`ExecEnable,ExecUser,ExecSymbol,ExecThread,ExecMacro,ExecMicro`. A
+10,000,000-tick window is sufficient; use an uncompressed trace and terminate
+after the window closes.
+
+### Full Exec Window Identifies COMGR/Clang Blit-Kernel Compilation
+
+The corrected bounded run used:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -d m5out-hip-memset-exec \
+  --debug-start=60000000000 \
+  --debug-end=60010000000 \
+  --debug-flags=ExecEnable,ExecUser,ExecSymbol,ExecThread,ExecMacro,ExecMicro \
+  --debug-file=hip-memset-exec-full.trace \
+  --stdout-file=stdout.txt \
+  --stderr-file=stderr.txt \
+  --listener-mode=off \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py \
+  --cpu-type timing \
+  --app tests/test-progs/gpu/hip-api-smoke/hip_api_smoke \
+  --opts="--stage memset" \
+  --rocm-path \
+  /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1
+```
+
+Inspection commands:
+
+```bash
+nl -ba m5out-hip-memset-exec/hip-memset-exec-full.trace
+```
+
+```bash
+awk '$5 ~ /^0x/ && $5 !~ /\./ {print $5}' \
+  m5out-hip-memset-exec/hip-memset-exec-full.trace \
+  | sort | uniq -c | sort -nr
+```
+
+```bash
+addr2line -C -f -p \
+  -e .deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib/libamd_comgr.so.1.9.40001 \
+  0x2ae58ee 0x2ae1b87
+```
+
+The trace is 5.7 MiB and correctly covers ticks 60,000,000,000 through
+60,010,000,000. The overall run ended later at:
+
+```text
+simTicks 158417267157
+hostSeconds 793.32
+simInsts 198519912
+```
+
+The trace contains active execution on cores 1 and 2. Addresses in the
+`0x7ffff2ae...` range map, with load base `0x7ffff0000000`, into
+`libamd_comgr.so.1.9.40001`. `addr2line` identifies Clang recursive AST visitor
+functions, including:
+
+```text
+clang::RecursiveASTVisitor<...>::TraverseOMPTargetUpdateDirective(...)
+clang::RecursiveASTVisitor<...>::TraverseObjCProtocolExpr(...)
+```
+
+Core 1 repeatedly calls many distinct functions from this AST traversal rather
+than spinning on one instruction. Core 2 repeatedly scans object structures
+and performs an indirect virtual call. This is consistent with COMGR/Clang
+internal-kernel compilation and its helper work, not GPU request processing.
+
+Facts confirmed:
+
+- ROCm's first non-SDMA `hipMemset` is synchronously creating/compiling its
+  internal blit/fill kernel through `libamd_comgr`;
+- the long delay occurs before compute-queue/AQL submission;
+- no GPU kernel, Ruby request, or VRAM request is waiting for a response;
+- ignored `mprotect` is associated with compiler/runtime setup, but the trace
+  does not show it as the loop condition;
+- the compilation is making CPU-side progress through AST traversal, although
+  it is prohibitively expensive under detailed Timing CPU simulation.
+
+No source file was changed during inspection.
+
+Next diagnostic step: inspect ROCm 4's blit-kernel creation controls and cache
+path to determine whether the internal `__amd_rocclr_fillBuffer` code object can
+be precompiled or reused, avoiding in-simulation COMGR compilation. Do not
+continue longer Timing CPU runs of the same unmodified `hipMemset` path.
+
+### ROCclr 4.0 Source Inspection and Bounded APU Control
+
+The matching official ROCclr source was inspected from the `rocm-4.0.x`
+branch:
+
+```bash
+git clone --depth 1 --branch rocm-4.0.x \
+  https://github.com/ROCm/ROCclr.git /tmp/ROCclr-rocm-4.0.x
+```
+
+Relevant source searches and inspections:
+
+```bash
+rg -n \
+  'createBlitProgram|BlitProgram|KernelBlitManager|HostBlitManager|fillBuffer' \
+  /tmp/ROCclr-rocm-4.0.x/device
+```
+
+```bash
+rg -n \
+  'OCL_CODE_CACHE_ENABLE|OCL_CODE_CACHE_RESET|GPU_DUMP_BLIT_KERNELS|GPU_BLIT_ENGINE_TYPE' \
+  /tmp/ROCclr-rocm-4.0.x
+```
+
+Source facts:
+
+- `device/device.cpp`, `Device::BlitProgram::create()`, concatenates ROCclr's
+  built-in blit OpenCL sources and calls `program_->build(...)`;
+- `device/rocm/rocvirtual.cpp`, `roc::VirtualGPU::create()`,
+  unconditionally creates a `KernelBlitManager` for the ROCr backend;
+- `device/rocm/rocblit.cpp`, `KernelBlitManager::createProgram()`, invokes
+  `device.createBlitProgram()` and creates the complete set of blit kernels
+  before `fillBuffer()` can dispatch;
+- `GPU_BLIT_ENGINE_TYPE` does not select `HostBlitManager` in this ROCr
+  backend, so setting it to host mode cannot bypass compilation here;
+- `OCL_CODE_CACHE_ENABLE` and `OCL_CODE_CACHE_RESET` both default to false in
+  `utils/flags.hpp`;
+- the compiler option named `kernel-cache` is not evidence that ROCclr's
+  persistent runtime cache is enabled; the runtime cache switch remains
+  disabled by default.
+
+This confirms that the observed COMGR/Clang work is expected first-use ROCclr
+behavior: with SDMA disabled, `hipMemset` reaches a kernel blit manager whose
+initialization builds the whole internal blit program synchronously.
+
+The APU configuration was also inspected. `configs/example/apu_se.py` sets
+`HSA_ENABLE_SDMA=0`, so it uses the same non-SDMA premise. Unlike the stdlib
+XGMI script's current environment, its normal environment retains the user's
+`HOME`. Existing APU tests primarily launch precompiled code objects and
+therefore do not establish that first-use `hipMemset` avoids ROCclr
+compilation.
+
+Two rejected APU invocations failed during configuration, before simulation:
+
+```text
+--cpu-type=TimingSimpleCPU
+fatal: Valid CPU types are X86TimingSimpleCPU and X86O3CPU
+```
+
+```text
+--gfx-version=gfx900
+AssertionError: Incorrect gfx version for APU
+```
+
+The corrected, foreground, bounded APU control was:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -d m5out-apu-hip-memset-control \
+  --listener-mode=off \
+  --debug-start=45000000000 \
+  --debug-flags=GPUDriver,HSAPacketProcessor,GPUCommandProc,GPUDisp \
+  configs/example/apu_se.py \
+  -n 3 \
+  --reg-alloc-policy=dynamic \
+  --gfx-version=gfx902 \
+  --cpu-type=X86TimingSimpleCPU \
+  -m 70000000000 \
+  -c tests/test-progs/gpu/hip-api-smoke/hip_api_smoke \
+  -o '--stage memset'
+```
+
+Observable result:
+
+```text
+simTicks 70000000000
+simInsts 17614029
+hostSeconds 86.79
+```
+
+The run stopped at the configured tick limit before the program reached its
+first `hipGetDeviceCount` marker. Only CPU core 0 was active and no GPU kernel
+was submitted. Therefore this bounded APU run neither reproduces nor rejects
+the `hipMemset` compilation delay. Extending it blindly is not useful because
+the APU setup is substantially slower before the test reaches the HIP API.
+
+Facts confirmed:
+
+- both SE configurations disable SDMA and consequently depend on ROCclr's
+  kernel-based blit path;
+- the XGMI `hipMemset` delay is explained by ROCclr source behavior and the
+  COMGR execution trace, not by a missing GPU/Ruby response;
+- `GPU_BLIT_ENGINE_TYPE` cannot select host fill in the ROCr backend;
+- persistent ROCclr code caching is disabled by default;
+- the bounded APU control did not run far enough to compare `hipMemset`.
+
+Hypotheses rejected:
+
+- selecting host blit solely through `GPU_BLIT_ENGINE_TYPE`;
+- treating passing APU programs with precompiled kernels as evidence that
+  first-use `hipMemset` does not compile internal kernels;
+- using another long APU TimingSimpleCPU run as the next diagnostic.
+
+No gem5 or test source was changed during this step. The only changed file is
+this status document. A temporary official source checkout exists at
+`/tmp/ROCclr-rocm-4.0.x`; bounded APU output is in
+`m5out-apu-hip-memset-control/`.
+
+Next diagnostic step: enable `OCL_CODE_CACHE_ENABLE=1` in a bounded run with a
+writable, persistent `HOME`, and trace file-related syscalls to identify the
+actual cache path and determine whether ROCclr creates a reusable blit program
+cache. This first run may still require compilation; the important question is
+whether a second run can consume the generated cache without entering COMGR.
+
+### ROCclr Persistent-Cache Probe Does Not Avoid First-Run Compilation
+
+The XGMI config was given two diagnostic-only CLI capabilities:
+
+- repeatable `--env KEY=VALUE`, which replaces a matching default ROCm
+  environment variable or appends a new one;
+- absolute `--max-ticks`, which bounds every simulation run.
+
+The config also accepts `--cpu-type atomic` so CPU-only runtime/compiler work
+can be investigated when KVM is unavailable. No change to the compiled gem5
+binary is required because the config passes the resulting list through the
+existing `SEViperBoard.set_se_gpu_binary_workload(env_list=...)` interface.
+
+Configuration probes:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -d /tmp/m5out-env-probe \
+  --listener-mode=off \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py \
+  --cpu-type timing \
+  --app /bin/true \
+  --rocm-path \
+  /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  --env HOME=/tmp/rocclr-home \
+  --env OCL_CODE_CACHE_ENABLE=1
+```
+
+This completed normally. A separate 1,000,000-tick probe confirmed that
+`--max-ticks` exits with `simulate() limit reached`.
+
+KVM was attempted first:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -d m5out-hip-memset-cache-first \
+  --listener-mode=off \
+  --debug-flags=SyscallAll \
+  --debug-file=hip-memset-cache-syscalls.trace \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py \
+  --cpu-type kvm \
+  --max-ticks 100000000000 \
+  --app tests/test-progs/gpu/hip-api-smoke/hip_api_smoke \
+  --opts='--stage memset' \
+  --rocm-path \
+  /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  --env HOME=/tmp/rocclr-home \
+  --env OCL_CODE_CACHE_ENABLE=1
+```
+
+It failed before simulation:
+
+```text
+KVM is required but is unavailable on this system
+```
+
+The bounded Timing run used the same command with `--cpu-type timing`. It
+ended automatically at:
+
+```text
+simTicks 100000000000
+simInsts 104823050
+hostSeconds 445.56
+```
+
+`config.ini` confirms that the guest process received:
+
+```text
+HOME=/tmp/rocclr-home
+OCL_CODE_CACHE_ENABLE=1
+HSA_ENABLE_SDMA=0
+```
+
+The syscall trace is an uncompressed 24 MiB file at:
+
+```text
+m5out-hip-memset-cache-first/hip-memset-cache-syscalls.trace
+```
+
+At approximately 56.9 billion ticks, ROCclr created only:
+
+```text
+/tmp/comgr-2a605a/include/opencl1.2-c.pch
+/tmp/comgr-2a605a/input/CompileSource
+/tmp/comgr-2a605a/output/CompileSource-3de2c865.bc.tmp
+```
+
+There was no syscall containing `/tmp/rocclr-home`, no `.cache` or
+kernel-cache directory, and no persistent file outside the COMGR temporary
+tree. The run was still compiling when it reached its limit. All GPU
+instruction and completed-workgroup counters were zero.
+
+An AtomicSimpleCPU configuration probe then completed normally:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -d /tmp/m5out-atomic-probe \
+  --listener-mode=off \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py \
+  --cpu-type atomic \
+  --max-ticks 1000000000 \
+  --app /bin/true \
+  --rocm-path \
+  /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  --env HOME=/tmp/rocclr-home \
+  --env OCL_CODE_CACHE_ENABLE=1
+```
+
+Ruby reports `atomic_noncaching` memory mode for this CPU. This is unsuitable
+for cache-timing conclusions but valid for accelerating the CPU-only compiler
+and filesystem investigation.
+
+The bounded atomic cache-generation run was:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -d m5out-hip-memset-cache-atomic-first \
+  --listener-mode=off \
+  --debug-flags=SyscallAll \
+  --debug-file=hip-memset-cache-syscalls.trace \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py \
+  --cpu-type atomic \
+  --max-ticks 100000000000 \
+  --app tests/test-progs/gpu/hip-api-smoke/hip_api_smoke \
+  --opts='--stage memset' \
+  --rocm-path \
+  /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  --env HOME=/tmp/rocclr-home \
+  --env OCL_CODE_CACHE_ENABLE=1
+```
+
+It also ended automatically:
+
+```text
+simTicks 100000000000
+simInsts 240320934
+hostSeconds 371.14
+```
+
+Atomic execution advanced farther: it completed the first `CompileSource`
+temporary phase, removed that COMGR tree, and entered a second
+`/tmp/comgr-e59861` phase. It still did not return from `hipMemset`, create a
+persistent cache file, submit a GPU kernel, or execute a GPU instruction.
+
+Facts confirmed:
+
+- the cache environment variables are correctly propagated into the simulated
+  process;
+- `OCL_CODE_CACHE_ENABLE=1` does not avoid ROCclr's expensive first-run
+  internal blit compilation;
+- no persistent-cache lookup or write occurs during the observed frontend
+  compilation phases;
+- AtomicSimpleCPU makes more CPU/compiler progress but still cannot complete
+  the complete blit build within the tested bound;
+- a second-run cache-hit experiment cannot yet be performed because the first
+  run produced no persistent cache artifact;
+- the original `hipMemset` diagnosis remains CPU-side COMGR compilation before
+  AQL/GPU submission.
+
+Hypotheses rejected:
+
+- the original `HOME=/` setting alone explains why compilation starts;
+- simply enabling `OCL_CODE_CACHE_ENABLE` makes the first simulated run
+  practical;
+- a cache artifact is created before ROCclr finishes its internal blit
+  program build.
+
+Files changed:
+
+- `configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- `/bin/true` completed through the environment-override configuration;
+- a 1,000,000-tick run stopped at the exact configured bound;
+- the atomic configuration completed a `/bin/true` probe;
+- both HIP cache probes stopped automatically at 100,000,000,000 ticks;
+- both `stats.txt` files report zero GPU instructions/workgroups;
+- syscall and filesystem inspection found only COMGR temporary artifacts.
+
+Next diagnostic step: generate the ROCclr gfx900 blit program outside detailed
+simulation, then determine whether ROCclr 4.0.1 can import that artifact as its
+internal blit program. Continuing first-run COMGR compilation for hundreds of
+billions of simulated ticks is not the next step.
+
+### Precompiled HSA Kernel Compatibility Layer Implements `hipMemset`
+
+The first SE compatibility implementation was added under:
+
+```text
+tests/test-progs/gpu/hip-api-smoke/se_hip_compat/
+```
+
+It exports the public synchronous `hipMemset` symbol through an
+`LD_PRELOAD` library and uses a precompiled gfx900 code-object-v2 byte-fill
+kernel.
+
+The first implementation used `hipModuleLoad` and `hipModuleGetFunction`.
+Atomic runs in:
+
+```text
+m5out-hip-memset-preload-atomic/
+m5out-hip-memset-preload-atomic-kd/
+```
+
+confirmed that `hipModuleLoad` accepted the HSACO but
+`hipModuleGetFunction` returned `hipErrorNotFound` for both:
+
+```text
+seHipMemsetKernel
+seHipMemsetKernel@kd
+```
+
+`readelf -n` identified the code-object-v2 metadata symbol as
+`seHipMemsetKernel@kd`. Existing peer-VRAM tests successfully load the same
+format through the HSA executable API. The HIP module path was therefore
+rejected for this ROCm 4.0.1 code-object-v2 use case.
+
+The compatibility library now:
+
+1. resolves the current device through `dlsym(RTLD_NEXT, "hipGetDevice")`;
+2. selects the corresponding HSA GPU agent;
+3. loads the HSACO with `hsa_executable_load_agent_code_object`;
+4. resolves the kernel with the normal-name/`@kd` fallback;
+5. creates a private HSA queue;
+6. submits an `hsa_kernel_dispatch_packet_t`;
+7. waits for the completion signal before returning from `hipMemset`.
+
+Build commands:
+
+```bash
+make -C tests/test-progs/gpu/hip-api-smoke/se_hip_compat \
+  ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc
+```
+
+```bash
+make -C tests/test-progs/gpu/hip-api-smoke \
+  ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc \
+  hip_memset_preload_smoke
+```
+
+Binary verification:
+
+```bash
+nm -D --defined-only \
+  tests/test-progs/gpu/hip-api-smoke/se_hip_compat/libse_hip_compat.so
+```
+
+shows one exported `hipMemset`. `readelf -sW` on
+`se_hip_memset.hsaco` shows `seHipMemsetKernel`. A host-only boundary probe
+confirmed:
+
+```text
+hipMemset(nullptr, value, 0) = hipSuccess
+hipMemset(nullptr, value, 1) = hipErrorInvalidDevicePointer
+```
+
+The cumulative `--stage memset` smoke proved that the wrapper's `hipMemset`
+returned, but its following explicit `hipDeviceSynchronize()` caused ROCclr to
+create its first `VirtualGPU`, which unconditionally creates the
+`KernelBlitManager` and restarts the known COMGR build. This is a separate API
+initialization issue, so a focused diagnostic
+`hip_memset_preload_smoke` was added. It performs:
+
+```text
+hipSetDevice -> hipMalloc -> hipMemset -> direct SE validation
+```
+
+It does not call `hipDeviceSynchronize` or `hipMemcpy`. The synchronous HSA
+completion in the wrapper makes the direct validation ordered.
+
+The successful bounded Atomic command was:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -d m5out-hip-memset-preload-isolated-atomic \
+  --listener-mode=off \
+  --debug-flags=GPUDriver,HSAPacketProcessor,GPUCommandProc,GPUDisp,SyscallAll \
+  --debug-file=hip-memset-preload.trace \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py \
+  --cpu-type atomic \
+  --max-ticks 100000000000 \
+  --app tests/test-progs/gpu/hip-api-smoke/hip_memset_preload_smoke \
+  --rocm-path \
+  /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  --env LD_PRELOAD=/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke/se_hip_compat/libse_hip_compat.so \
+  --env SE_HIP_MEMSET_HSACO=/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_memset.hsaco
+```
+
+It printed:
+
+```text
+HIP_MEMSET_PRELOAD_PASSED
+Exiting @ tick 23745191040 because exiting with last active thread context.
+```
+
+GPU0 executed nonzero instructions, global memory operations, and completed
+workgroups. No `/tmp/comgr-*` directory or `CompileSource` syscall occurred.
+Loading `libamd_comgr.so` as a normal ROCm dependency still occurs and is not
+evidence of compilation.
+
+Because AtomicSimpleCPU uses Ruby `atomic_noncaching`, the final validation
+used Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt \
+  -d m5out-hip-memset-preload-timing-m5exit \
+  --listener-mode=off \
+  --debug-flags=GPUDriver,HSAPacketProcessor,GPUCommandProc,GPUDisp,SyscallAll \
+  --debug-file=hip-memset-preload-timing.trace \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py \
+  --cpu-type timing \
+  --max-ticks 100000000000 \
+  --app tests/test-progs/gpu/hip-api-smoke/hip_memset_preload_smoke \
+  --rocm-path \
+  /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  --env LD_PRELOAD=/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke/se_hip_compat/libse_hip_compat.so \
+  --env SE_HIP_MEMSET_HSACO=/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_memset.hsaco
+```
+
+The first Timing run printed the pass marker but then hit an unrelated
+`TimingSimpleCPU::suspendContext` assertion during process `exit_group`.
+The focused diagnostic now calls `m5_exit` after successful validation. The
+repeated Timing run completed cleanly:
+
+```text
+HIP_MEMSET_PRELOAD_PASSED
+Exiting @ tick 45928600758 because m5_exit instruction encountered.
+```
+
+Timing statistics confirm:
+
+- nonzero GPU instructions, global memory operations, and completed
+  workgroups on all four GPU0 CUs;
+- nonzero TCP, SQC, TCC, directory, internal-link, and router Ruby message
+  counts;
+- no `/tmp/comgr-*` or `CompileSource` activity.
+
+Facts confirmed:
+
+- the public synchronous `hipMemset` API can be supported in SE mode without
+  SDMA and without in-simulation ROCclr blit compilation;
+- code-object-v2 loading must use the HSA executable API with this ROCm 4.0.1
+  stack;
+- Atomic CPU is suitable for fast functional iteration;
+- Timing CPU confirms the normal Ruby request path;
+- the original cumulative smoke proceeds past `hipMemset`, and its next
+  blocker is first-use `hipDeviceSynchronize`/`VirtualGPU` initialization.
+
+Files changed:
+
+- `configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py`
+- `tests/test-progs/gpu/hip-api-smoke/Makefile`
+- `tests/test-progs/gpu/hip-api-smoke/hip_memset_preload_smoke.hip`
+- `tests/test-progs/gpu/hip-api-smoke/se_hip_compat/Makefile`
+- `tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_compat.cpp`
+- `tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_memset.hip`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- design and implementation-plan documents for this compatibility layer;
+- this status document.
+
+Next diagnostic step: inspect and prototype lazy creation of ROCclr's
+`KernelBlitManager` so that `hipDeviceSynchronize` and ordinary HIP kernel
+launch do not compile the complete blit program unless a blit API is actually
+used.
