@@ -393,6 +393,122 @@ class SEViperMultiGPUTest(unittest.TestCase):
             syscall_table,
         )
 
+    def test_x86_frndint_uses_fcw_rounding_mode(self):
+        round_macro = Path(
+            "src/arch/x86/isa/insts/x87/arithmetic/round.py"
+        ).read_text()
+        fp_microops = Path(
+            "src/arch/x86/isa/microops/fpop.isa"
+        ).read_text()
+        decoder = Path(
+            "src/arch/x86/isa/decoder/x87.isa"
+        ).read_text()
+
+        self.assertIn("def macroop FRNDINT", round_macro)
+        self.assertIn("rdval t1, fcw", round_macro)
+        self.assertIn("roundfp st(0), st(0), t1", round_macro)
+        self.assertIn("0x4: Inst::FRNDINT();", decoder)
+
+        self.assertIn("class Roundfp(FpOp)", fp_microops)
+        self.assertIn(
+            "operand_types = (FloatDestOp, FloatSrc1Op, IntSrc2Op)",
+            fp_microops,
+        )
+        self.assertIn("bits(SrcReg2, 11, 10)", fp_microops)
+        self.assertIn("std::nearbyint(FpSrcReg1)", fp_microops)
+        self.assertIn("std::floor(FpSrcReg1)", fp_microops)
+        self.assertIn("std::ceil(FpSrcReg1)", fp_microops)
+        self.assertIn("std::trunc(FpSrcReg1)", fp_microops)
+
+    def test_hip_api_smoke_uses_public_hip_cumulative_stages(self):
+        root = Path("tests/test-progs/gpu/hip-api-smoke")
+        source = (root / "hip_api_smoke.hip").read_text()
+        makefile = (root / "Makefile").read_text()
+        preload_smoke = (
+            root / "hip_memset_preload_smoke.hip"
+        ).read_text()
+
+        for stage in ("malloc", "memset", "memcpy", "launch", "lifecycle"):
+            self.assertIn(f'"{stage}"', source)
+
+        required_calls = (
+            "hipGetDeviceCount",
+            "hipSetDevice(0)",
+            "hipMalloc",
+            "hipMemset",
+            "hipMemcpyHostToDevice",
+            "hipMemcpyDeviceToHost",
+            "hipGetLastError",
+            "hipDeviceSynchronize",
+            "hipFree",
+        )
+        for call in required_calls:
+            self.assertIn(call, source)
+
+        self.assertIn("transform_kernel<<<", source)
+        self.assertIn("validate_memset", source)
+        self.assertIn("validate_round_trip", source)
+        self.assertIn("validate_kernel", source)
+        self.assertIn("API_STAGE_PASSED stage=%s", source)
+        self.assertIn("LIFECYCLE_PASSED", source)
+
+        malloc_pos = source.index("run_malloc_stage")
+        memset_pos = source.index("run_memset_stage")
+        memcpy_pos = source.index("run_memcpy_stage")
+        launch_pos = source.index("run_launch_stage")
+        free_pos = source.index("HIP_CHECK(hipFree")
+        lifecycle_pos = source.index('std::printf("LIFECYCLE_PASSED')
+        return_pos = source.index("return 0;", lifecycle_pos)
+        self.assertLess(malloc_pos, memset_pos)
+        self.assertLess(memset_pos, memcpy_pos)
+        self.assertLess(memcpy_pos, launch_pos)
+        self.assertLess(launch_pos, free_pos)
+        self.assertLess(free_pos, lifecycle_pos)
+        self.assertLess(lifecycle_pos, return_pos)
+
+        self.assertNotIn("#include <hsa/", source)
+        self.assertNotIn("hsa_", source)
+        self.assertNotIn("m5_exit", source)
+        self.assertNotIn("m5_fail", source)
+        self.assertNotIn("volatile const uint32_t *", source)
+
+        self.assertIn("--offload-arch=gfx900", makefile)
+        self.assertIn("-mno-code-object-v3", makefile)
+        self.assertNotIn("m5op", source)
+        self.assertNotIn("-lhsa-runtime64", makefile)
+        self.assertNotIn("-lhsakmt", makefile)
+        self.assertIn("hipMemset", preload_smoke)
+        self.assertIn("volatile const", preload_smoke)
+        self.assertNotIn("hipDeviceSynchronize", preload_smoke)
+        self.assertNotIn("hipMemcpy", preload_smoke)
+        self.assertIn("m5_exit", preload_smoke)
+        self.assertIn("HIP_MEMSET_PRELOAD_PASSED", preload_smoke)
+        self.assertIn("hip_memset_preload_smoke", makefile)
+
+    def test_se_hip_memset_compatibility_layer_contract(self):
+        root = Path(
+            "tests/test-progs/gpu/hip-api-smoke/se_hip_compat"
+        )
+        kernel = (root / "se_hip_memset.hip").read_text()
+        wrapper = (root / "se_hip_compat.cpp").read_text()
+        makefile = (root / "Makefile").read_text()
+
+        self.assertIn('extern "C" __global__ void', kernel)
+        self.assertIn("seHipMemsetKernel", kernel)
+        self.assertIn('extern "C" hipError_t', wrapper)
+        self.assertIn("hipMemset(void *dst", wrapper)
+        self.assertIn("RTLD_NEXT", wrapper)
+        self.assertIn("hsa_executable_load_agent_code_object", wrapper)
+        self.assertIn("hsa_executable_get_symbol_by_name", wrapper)
+        self.assertIn('"seHipMemsetKernel@kd"', wrapper)
+        self.assertIn("hsa_queue_create", wrapper)
+        self.assertIn("hsa_kernel_dispatch_packet_t", wrapper)
+        self.assertIn("hsa_signal_wait_scacquire", wrapper)
+        self.assertIn("SE_HIP_MEMSET_HSACO", wrapper)
+        self.assertIn("--offload-arch=gfx900", makefile)
+        self.assertIn("-mno-code-object-v3", makefile)
+        self.assertIn("-shared", makefile)
+
     def test_peer_invalidate_diagnostic_has_host_sequenced_phases(self):
         root = Path("tests/test-progs/gpu/xgmi-peer-invalidate")
         host = (root / "invalidate_hip.cpp").read_text()

@@ -28,7 +28,10 @@ from gem5.components.memory.single_channel import SingleChannelHBM
 from gem5.components.processors.cpu_types import CPUTypes
 from gem5.components.processors.simple_processor import SimpleProcessor
 from gem5.isas import ISA
-from gem5.prebuilt.viper.se_board import SEViperBoard
+from gem5.prebuilt.viper.se_board import (
+    SEViperBoard,
+    _default_rocm_env,
+)
 from gem5.prebuilt.viper.se_gpu_cache_hierarchy import (
     SEViperXGMICacheHierarchy,
 )
@@ -63,8 +66,15 @@ parser.add_argument(
     help="ROCm runtime path visible to the SE process",
 )
 parser.add_argument(
+    "--env",
+    action="append",
+    default=[],
+    metavar="KEY=VALUE",
+    help="Override or add an environment variable for the SE process",
+)
+parser.add_argument(
     "--cpu-type",
-    choices=("kvm", "timing"),
+    choices=("atomic", "kvm", "timing"),
     default="kvm",
     help="Host CPU model. KVM is recommended for the ROCm runtime path.",
 )
@@ -73,6 +83,12 @@ parser.add_argument(
     default=False,
     action="store_true",
     help="Use KVM perf counters when --cpu-type=kvm.",
+)
+parser.add_argument(
+    "--max-ticks",
+    type=int,
+    default=None,
+    help="Stop after this absolute simulated tick",
 )
 parser.add_argument(
     "--disable-wb-l2",
@@ -104,7 +120,11 @@ cpu_memory_size = toMemorySize(args.cpu_memory_size)
 gpu_memory_size = toMemorySize(args.gpu_memory_size)
 gpu_vram_base = cpu_memory_size + 0x40000000
 
-cpu_type = CPUTypes.KVM if args.cpu_type == "kvm" else CPUTypes.TIMING
+cpu_type = {
+    "atomic": CPUTypes.ATOMIC,
+    "kvm": CPUTypes.KVM,
+    "timing": CPUTypes.TIMING,
+}[args.cpu_type]
 processor = SimpleProcessor(
     cpu_type=cpu_type,
     isa=ISA.X86,
@@ -153,9 +173,27 @@ board = SEViperBoard(
 )
 
 app_args = args.opts.split() if args.opts else []
+rocm_env = _default_rocm_env(args.rocm_path)
+env_index = {
+    entry.partition("=")[0]: index
+    for index, entry in enumerate(rocm_env)
+}
+for entry in args.env:
+    key, separator, _ = entry.partition("=")
+    if not separator or not key:
+        raise ValueError(
+            f"--env must use KEY=VALUE syntax: {entry}"
+        )
+    if key in env_index:
+        rocm_env[env_index[key]] = entry
+    else:
+        env_index[key] = len(rocm_env)
+        rocm_env.append(entry)
+
 board.set_se_gpu_binary_workload(
     binary=BinaryResource(local_path=args.app),
     arguments=app_args,
+    env_list=rocm_env,
     rocm_path=args.rocm_path,
     cpu_cores_count=args.num_cpu_cores,
 )
@@ -163,7 +201,13 @@ board.set_se_gpu_binary_workload(
 root = board._pre_instantiate(full_system=False)
 m5.instantiate()
 
-exit_event = m5.simulate()
+def simulate_to_limit():
+    if args.max_ticks is None:
+        return m5.simulate()
+    return m5.simulate(max(0, args.max_ticks - m5.curTick()))
+
+
+exit_event = simulate_to_limit()
 while True:
     cause = exit_event.getCause()
     if (
@@ -194,7 +238,7 @@ while True:
     else:
         print(f"Unknown exit event: {cause}. Continuing...")
 
-    exit_event = m5.simulate()
+    exit_event = simulate_to_limit()
 
 print(
     "Exiting @ tick {} because {}.".format(
