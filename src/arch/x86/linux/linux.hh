@@ -39,15 +39,22 @@
 #ifndef __ARCH_X86_LINUX_LINUX_HH__
 #define __ARCH_X86_LINUX_LINUX_HH__
 
+#include <array>
+#include <iomanip>
 #include <map>
+#include <sstream>
 
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
 #include "arch/x86/utility.hh"
 #include "base/compiler.hh"
+#include "base/logging.hh"
 #include "kern/linux/flag_tables.hh"
 #include "kern/linux/linux.hh"
+#include "mem/se_translating_port_proxy.hh"
 #include "sim/guest_abi.hh"
+#include "sim/process.hh"
+#include "sim/system.hh"
 #include "sim/syscall_return.hh"
 
 namespace gem5
@@ -73,6 +80,83 @@ class X86Linux : public Linux
 
         if (stack)
             ctc->setReg(X86ISA::int_reg::Rsp, stack);
+
+        if (pp->kvmInSE && stack) {
+            constexpr uint64_t address_mask = 0x000ffffffffff000ULL;
+            const std::array<std::pair<int, int>, 4> index_bits = {{
+                {47, 39}, {38, 30}, {29, 21}, {20, 12}
+            }};
+            std::array<uint64_t, 4> entries = {};
+            std::array<Addr, 4> entry_addrs = {};
+            Addr table = ctc->readMiscRegNoEffect(
+                X86ISA::misc_reg::Cr3) & address_mask;
+            bool walk_valid = true;
+
+            for (size_t level = 0; level < index_bits.size(); ++level) {
+                const auto [high, low] = index_bits[level];
+                entry_addrs[level] =
+                    table + bits(stack, high, low) * sizeof(uint64_t);
+                entries[level] =
+                    pp->system->physProxy.read<uint64_t>(entry_addrs[level]);
+                if (!(entries[level] & 1)) {
+                    walk_valid = false;
+                    break;
+                }
+                table = entries[level] & address_mask;
+            }
+
+            const Addr walked_paddr =
+                walk_valid ? table + bits(stack, 11, 0) : 0;
+            std::array<uint64_t, 2> walked_words = {};
+            if (walk_valid) {
+                pp->system->physProxy.readBlob(
+                    walked_paddr, walked_words.data(),
+                    sizeof(walked_words));
+            }
+            std::array<uint8_t, 24> clone_return_bytes = {};
+            SETranslatingPortProxy(ptc).readBlob(
+                ptc->getReg(X86ISA::int_reg::Rcx),
+                clone_return_bytes.data(), clone_return_bytes.size());
+
+            std::ostringstream trace;
+            trace << std::hex << std::showbase
+                  << "KVM SE hardware page walk: cr3="
+                  << ctc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3)
+                  << " stack=" << stack
+                  << " parent_pc=" << ptc->pcState().instAddr()
+                  << " parent_rcx="
+                  << ptc->getReg(X86ISA::int_reg::Rcx)
+                  << " parent_rax="
+                  << ptc->getReg(X86ISA::int_reg::Rax)
+                  << " parent_rdi="
+                  << ptc->getReg(X86ISA::int_reg::Rdi)
+                  << " child_pc=" << ctc->pcState().instAddr()
+                  << " child_rcx="
+                  << ctc->getReg(X86ISA::int_reg::Rcx)
+                  << " child_rax="
+                  << ctc->getReg(X86ISA::int_reg::Rax)
+                  << " child_rdi="
+                  << ctc->getReg(X86ISA::int_reg::Rdi)
+                  << " valid=" << std::dec << walk_valid
+                  << std::hex;
+            for (size_t level = 0; level < entries.size(); ++level) {
+                trace << " l" << (4 - level) << "_addr="
+                      << entry_addrs[level]
+                      << " l" << (4 - level) << "_entry="
+                      << entries[level];
+            }
+            trace << " walked_paddr=" << walked_paddr
+                  << " walked_function=" << walked_words[0]
+                  << " walked_argument=" << walked_words[1]
+                  << " clone_return_bytes=";
+            trace << std::noshowbase << std::setfill('0');
+            for (const auto byte : clone_return_bytes) {
+                trace << std::setw(2)
+                      << static_cast<unsigned int>(byte);
+            }
+            trace << "\n";
+            inform("%s", trace.str());
+        }
     }
 
     class SyscallABI {};

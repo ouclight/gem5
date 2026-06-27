@@ -294,8 +294,11 @@ Process::initState()
     // first thread context for this process... initialize & enable
     ThreadContext *tc = system->threads[contextIds[0]];
 
-    // mark this context as active so it will start ticking.
-    tc->activate();
+    // doClone() must finish copying the parent's architectural state before
+    // the child starts executing. It activates clone contexts after
+    // archClone() and returnInto() have installed that state.
+    if (!tc->getUseForClone())
+        tc->activate();
 
     pTable->initState();
 

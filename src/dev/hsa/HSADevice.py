@@ -34,6 +34,14 @@ from m5.proxy import *
 from m5.SimObject import SimObject
 
 
+class SESDMAEngine(DmaVirtDevice):
+    type = "SESDMAEngine"
+    cxx_header = "dev/hsa/se_sdma_engine.hh"
+    cxx_class = "gem5::SESDMAEngine"
+
+    gpuId = Param.UInt32("KFD GPU id for this SE SDMA engine")
+
+
 class HSAPacketProcessor(DmaVirtDevice):
     type = "HSAPacketProcessor"
     cxx_header = "dev/hsa/hsa_packet_processor.hh"
@@ -52,4 +60,7 @@ class HSAPacketProcessor(DmaVirtDevice):
     pktProcessDelay = Param.Tick(4400000, "Packet processing delay")
     walker = Param.VegaPagetableWalker(
         VegaPagetableWalker(), "Page table walker"
+    )
+    sdmaEngine = Param.SESDMAEngine(
+        NULL, "Optional SE-mode SDMA engine attached to this packet processor"
     )

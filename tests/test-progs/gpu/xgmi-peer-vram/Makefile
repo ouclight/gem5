@@ -15,6 +15,12 @@ HSA_TARGET ?= hsa_agent_count
 HSA_SRC := hsa_agent_count.cpp
 HSA_LOAD_TARGET ?= hsa_module_load
 HSA_LOAD_SRC := hsa_module_load.cpp
+HSA_SDMA_FILL_TARGET ?= hsa_sdma_fill
+HSA_SDMA_FILL_SRC := hsa_sdma_fill.cpp
+HSA_SDMA_ASYNC_COPY_TARGET ?= hsa_sdma_async_copy
+HSA_SDMA_ASYNC_COPY_SRC := hsa_sdma_async_copy.cpp
+HSA_SDMA_PEER_ASYNC_COPY_TARGET ?= hsa_sdma_peer_async_copy
+HSA_SDMA_PEER_ASYNC_COPY_SRC := hsa_sdma_peer_async_copy.cpp
 HIPCCFLAGS ?=
 HSACO_HIPCCFLAGS ?= -mno-code-object-v3
 HSA_CXXFLAGS ?= -O2
@@ -28,7 +34,7 @@ endif
 
 .PHONY: all clean
 
-all: $(TARGET) $(HSA_TARGET) $(HSA_LOAD_TARGET)
+all: $(TARGET) $(HSA_TARGET) $(HSA_LOAD_TARGET) $(HSA_SDMA_FILL_TARGET) $(HSA_SDMA_ASYNC_COPY_TARGET) $(HSA_SDMA_PEER_ASYNC_COPY_TARGET)
 
 $(TARGET): $(SRC) $(HSACO_TARGET) $(M5OP_LIB)
 	$(HIPCC) $(HIPCCFLAGS) -O2 -I$(GEM5_ROOT)/include -DPEER_VRAM_HSACO_PATH=\"$(abspath $(HSACO_TARGET))\" -o $@ $(SRC) -L. -lm5op_x86 $(HIP_LDFLAGS) -lhsa-runtime64 -lhsakmt
@@ -51,5 +57,14 @@ $(HSA_TARGET): $(HSA_SRC)
 $(HSA_LOAD_TARGET): $(HSA_LOAD_SRC) $(HSACO_TARGET)
 	$(CXX) $(HSA_CXXFLAGS) -DPEER_VRAM_HSACO_PATH=\"$(abspath $(HSACO_TARGET))\" -o $@ $(HSA_LOAD_SRC) -lhsa-runtime64 -lhsakmt
 
+$(HSA_SDMA_FILL_TARGET): $(HSA_SDMA_FILL_SRC)
+	$(CXX) $(HSA_CXXFLAGS) -o $@ $(HSA_SDMA_FILL_SRC) -lhsa-runtime64 -lhsakmt
+
+$(HSA_SDMA_ASYNC_COPY_TARGET): $(HSA_SDMA_ASYNC_COPY_SRC)
+	$(CXX) $(HSA_CXXFLAGS) -o $@ $(HSA_SDMA_ASYNC_COPY_SRC) -lhsa-runtime64 -lhsakmt
+
+$(HSA_SDMA_PEER_ASYNC_COPY_TARGET): $(HSA_SDMA_PEER_ASYNC_COPY_SRC)
+	$(CXX) $(HSA_CXXFLAGS) -o $@ $(HSA_SDMA_PEER_ASYNC_COPY_SRC) -lhsa-runtime64 -lhsakmt
+
 clean:
-	$(RM) $(TARGET) $(M5OP_OBJ) $(M5OP_LIB) $(HSACO_TARGET) $(HSACO_BUNDLE_TARGET) $(HSA_TARGET) $(HSA_LOAD_TARGET)
+	$(RM) $(TARGET) $(M5OP_OBJ) $(M5OP_LIB) $(HSACO_TARGET) $(HSACO_BUNDLE_TARGET) $(HSA_TARGET) $(HSA_LOAD_TARGET) $(HSA_SDMA_FILL_TARGET) $(HSA_SDMA_ASYNC_COPY_TARGET) $(HSA_SDMA_PEER_ASYNC_COPY_TARGET)

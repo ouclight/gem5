@@ -31,8 +31,11 @@
 #include <linux/kvm.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
+#include <cstring>
 #include <memory>
+#include <sstream>
 
 #include "arch/x86/cpuid.hh"
 #include "arch/x86/faults.hh"
@@ -41,6 +44,7 @@
 #include "arch/x86/regs/float.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/msr.hh"
+#include "arch/x86/se_workload.hh"
 #include "arch/x86/utility.hh"
 #include "base/bitunion.hh"
 #include "base/compiler.hh"
@@ -50,6 +54,9 @@
 #include "debug/KvmContext.hh"
 #include "debug/KvmIO.hh"
 #include "debug/KvmInt.hh"
+#include "mem/se_translating_port_proxy.hh"
+#include "sim/process.hh"
+#include "sim/system.hh"
 
 namespace gem5
 {
@@ -755,8 +762,77 @@ X86KvmCPU::updateKvmStateRegs()
      * mistaken. We need to reconstruct it from a bunch of ucode
      * registers and wave a dead chicken over it (aka mask out and set
      * reserved bits) to get it to work.
-     */
+    */
     regs.rflags = X86ISA::getRFlags(tc);
+
+    if (tc->contextId() != 0) {
+        struct kvm_regs old_regs;
+        getRegisters(old_regs);
+        std::array<uint64_t, 2> stack_words = {};
+        std::array<uint64_t, 2> physical_stack_words = {};
+        std::array<uint64_t, 2> kvm_stack_words = {};
+        Addr stack_paddr = 0;
+        bool stack_translated = false;
+        bool kvm_stack_found = false;
+
+        if (regs.rip == syscallCodeVirtAddr + 10) {
+            auto *process = tc->getProcessPtr();
+            SETranslatingPortProxy(tc).readBlob(
+                regs.rsp, stack_words.data(), sizeof(stack_words));
+            stack_translated =
+                process->pTable->translate(regs.rsp, stack_paddr);
+            if (stack_translated) {
+                tc->getSystemPtr()->physProxy.readBlob(
+                    stack_paddr, physical_stack_words.data(),
+                    sizeof(physical_stack_words));
+                for (const auto &backing :
+                        tc->getSystemPtr()->getPhysMem().getBackingStore()) {
+                    if (!backing.kvmMap ||
+                            !backing.range.contains(stack_paddr)) {
+                        continue;
+                    }
+                    const Addr offset =
+                        stack_paddr - backing.range.start();
+                    std::memcpy(kvm_stack_words.data(),
+                                backing.pmem + offset,
+                                sizeof(kvm_stack_words));
+                    kvm_stack_found = true;
+                    break;
+                }
+            }
+        }
+        std::ostringstream trace;
+        trace << std::hex << std::showbase
+              << "KVM register sync TC->KVM: context=" << std::dec
+              << tc->contextId() << std::hex
+              << " tc_rip=" << regs.rip
+              << " tc_rbx=" << regs.rbx
+              << " tc_rsp=" << regs.rsp
+              << " tc_rdi=" << regs.rdi
+              << " tc_rcx=" << regs.rcx
+              << " tc_rax=" << regs.rax
+              << " kvm_rip=" << old_regs.rip
+              << " kvm_rbx=" << old_regs.rbx
+              << " kvm_rsp=" << old_regs.rsp
+              << " kvm_rdi=" << old_regs.rdi
+              << " kvm_rcx=" << old_regs.rcx
+              << " kvm_rax=" << old_regs.rax
+              << " stack0=" << stack_words[0]
+              << " stack1=" << stack_words[1]
+              << " stack_translated=" << std::dec
+              << stack_translated
+              << std::hex
+              << " stack_paddr=" << stack_paddr
+              << " physical_stack0=" << physical_stack_words[0]
+              << " physical_stack1=" << physical_stack_words[1]
+              << " kvm_stack_found=" << std::dec
+              << kvm_stack_found
+              << std::hex
+              << " kvm_stack0=" << kvm_stack_words[0]
+              << " kvm_stack1=" << kvm_stack_words[1]
+              << "\n";
+        inform("%s", trace.str());
+    }
 
     setRegisters(regs);
 }
@@ -1054,6 +1130,27 @@ void
 X86KvmCPU::updateThreadContextRegs(const struct kvm_regs &regs,
                                    const struct kvm_sregs &sregs)
 {
+    if (tc->contextId() != 0) {
+        std::ostringstream trace;
+        trace << std::hex << std::showbase
+              << "KVM register sync KVM->TC: context=" << std::dec
+              << tc->contextId() << std::hex
+              << " kvm_rip=" << regs.rip
+              << " kvm_rbx=" << regs.rbx
+              << " kvm_rsp=" << regs.rsp
+              << " kvm_rdi=" << regs.rdi
+              << " kvm_rcx=" << regs.rcx
+              << " kvm_rax=" << regs.rax
+              << " tc_rip=" << tc->pcState().instAddr()
+              << " tc_rbx=" << tc->getReg(int_reg::Rbx)
+              << " tc_rsp=" << tc->getReg(int_reg::Rsp)
+              << " tc_rdi=" << tc->getReg(int_reg::Rdi)
+              << " tc_rcx=" << tc->getReg(int_reg::Rcx)
+              << " tc_rax=" << tc->getReg(int_reg::Rax)
+              << "\n";
+        inform("%s", trace.str());
+    }
+
 #define APPLY_IREG(kreg, mreg) tc->setReg(mreg, regs.kreg)
 
     FOREACH_IREG();

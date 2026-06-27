@@ -490,29 +490,26 @@ X86_64Process::initState()
         // case the system call modified existing page mappings (e.g.,
         // munmap, mremap, brk). To do this, we can simply read/write
         // cr3; however, doing so requires saving the value to an
-        // intermediate GPR (%rax, in this case). We save/restore the
-        // value of %rax in the scratch region syscallDataBuf.
-        const Addr syscallDataBuf = syscallCodeVirtAddr + 0x100;
+        // intermediate GPR (%rax, in this case). Preserve the syscall
+        // return value in CR2, which is private to the vCPU and will be
+        // replaced by hardware before a page-fault handler consumes it.
+        // A fixed memory scratch address is unsafe because all KVM CPUs
+        // execute this handler concurrently.
         uint8_t syscallBlob[] = {
             // mov    %rax, (0xffffc90000007000)
             0x48, 0xa3, 0x00, 0x70, 0x00,
             0x00, 0x00, 0xc9, 0xff, 0xff,
-            // mov    %rax, (syscallDataBuf)
-            0x48, 0xa3, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00,
+            // mov    %rax, %cr2
+            0x0f, 0x22, 0xd0,
             // mov    %cr3, %rax
             0x0f, 0x20, 0xd8,
             // mov    %rax, %cr3
             0x0f, 0x22, 0xd8,
-            // mov    (syscallDataBuf), %rax
-            0x48, 0xa1, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00,
+            // mov    %cr2, %rax
+            0x0f, 0x20, 0xd0,
             // sysret
             0x48, 0x0f, 0x07
         };
-        assert(syscallDataBuf >= syscallCodePhysAddr + sizeof syscallBlob);
-        std::memcpy(&syscallBlob[12], &syscallDataBuf, sizeof syscallDataBuf);
-        std::memcpy(&syscallBlob[28], &syscallDataBuf, sizeof syscallDataBuf);
 
         physProxy.writeBlob(syscallCodePhysAddr,
                             syscallBlob, sizeof(syscallBlob));

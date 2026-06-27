@@ -154,6 +154,13 @@ class GPUComputeDriver final : public EmulatedDriver
     std::vector<int> vramPoolIds;
     uint32_t queueId;
     std::unordered_map<uint32_t, uint32_t> queueIdToDeviceIdx;
+    enum class QueueBackend
+    {
+        Compute,
+        Sdma,
+        SdmaXgmi,
+    };
+    std::unordered_map<uint32_t, QueueBackend> queueIdToBackend;
     bool isdGPU;
     GfxVersion gfxVersion;
     int dGPUPoolID;

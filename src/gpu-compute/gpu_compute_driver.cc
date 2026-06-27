@@ -212,11 +212,16 @@ GPUComputeDriver::allocateQueue(PortProxy &mem_proxy, Addr ioc_buf)
     args.copyIn(mem_proxy);
 
     DPRINTF(GPUDriver,
-            "AMDKFD_IOC_CREATE_QUEUE gpu_id %u type %u ring_base %#x "
-            "ring_size %#x read_ptr %#x write_ptr %#x\n",
-            args->gpu_id, args->queue_type, args->ring_base_address,
-            args->ring_size, args->read_pointer_address,
-            args->write_pointer_address);
+            "AMDKFD_IOC_CREATE_QUEUE request gpu_id %u queue_type %u "
+            "ring_base %#lx ring_size %#x read_ptr %#lx write_ptr %#lx "
+            "eop_buffer %#lx eop_size %#lx\n",
+            args->gpu_id, args->queue_type,
+            static_cast<uint64_t>(args->ring_base_address),
+            args->ring_size,
+            static_cast<uint64_t>(args->read_pointer_address),
+            static_cast<uint64_t>(args->write_pointer_address),
+            static_cast<uint64_t>(args->eop_buffer_address),
+            static_cast<uint64_t>(args->eop_buffer_size));
 
     if ((doorbellSize() * queueId) > 4096) {
         fatal("%s: Exceeded maximum number of HSA queues allowed\n", name());
@@ -232,13 +237,54 @@ GPUComputeDriver::allocateQueue(PortProxy &mem_proxy, Addr ioc_buf)
     args->queue_id = queueId++;
     auto &hsa_pp = deviceForGpuId(args->gpu_id).hsaPacketProc();
     queueIdToDeviceIdx[args->queue_id] = gpuIdToDeviceIdx.at(args->gpu_id);
-    hsa_pp.setDeviceQueueDesc(args->read_pointer_address,
-                              args->ring_base_address, args->queue_id,
-                              args->ring_size, doorbellSize(), gfxVersion);
+
+    const char *backend_name = "unknown";
+    switch (args->queue_type) {
+      case KFD_IOC_QUEUE_TYPE_COMPUTE:
+      case KFD_IOC_QUEUE_TYPE_COMPUTE_AQL:
+        backend_name = "compute";
+        hsa_pp.setDeviceQueueDesc(args->read_pointer_address,
+                                  args->ring_base_address, args->queue_id,
+                                  args->ring_size, doorbellSize(),
+                                  gfxVersion);
+        queueIdToBackend[args->queue_id] = QueueBackend::Compute;
+        break;
+      case KFD_IOC_QUEUE_TYPE_SDMA:
+        backend_name = "sdma";
+        hsa_pp.registerSDMAQueue(args->queue_id,
+                                 args->read_pointer_address,
+                                 args->write_pointer_address,
+                                 args->ring_base_address,
+                                 args->ring_size,
+                                 doorbellSize());
+        queueIdToBackend[args->queue_id] = QueueBackend::Sdma;
+        break;
+      case KFD_IOC_QUEUE_TYPE_SDMA_XGMI:
+        backend_name = "sdma_xgmi";
+        hsa_pp.registerSDMAQueue(args->queue_id,
+                                 args->read_pointer_address,
+                                 args->write_pointer_address,
+                                 args->ring_base_address,
+                                 args->ring_size,
+                                 doorbellSize());
+        queueIdToBackend[args->queue_id] = QueueBackend::Sdma;
+        break;
+      default:
+        fatal("Unsupported KFD queue type %u\n", args->queue_type);
+        break;
+    }
+
     args.copyOut(mem_proxy);
     DPRINTF(GPUDriver,
-            "AMDKFD_IOC_CREATE_QUEUE queue_id %u doorbell_offset %#x\n",
-            args->queue_id, args->doorbell_offset);
+            "AMDKFD_IOC_CREATE_QUEUE assigned queue_id %u queue_type %u "
+            "backend %s doorbell_offset %#lx doorbell_size %d gpu_id %u "
+            "ring_base %#lx ring_size %#x read_ptr %#lx write_ptr %#lx\n",
+            args->queue_id, args->queue_type, backend_name,
+            static_cast<uint64_t>(args->doorbell_offset), doorbellSize(),
+            args->gpu_id, static_cast<uint64_t>(args->ring_base_address),
+            args->ring_size,
+            static_cast<uint64_t>(args->read_pointer_address),
+            static_cast<uint64_t>(args->write_pointer_address));
 }
 
 void
@@ -322,9 +368,18 @@ GPUComputeDriver::ioctl(ThreadContext *tc, unsigned req, Addr ioc_buf)
             args.copyIn(virt_proxy);
             DPRINTF(GPUDriver, "ioctl: AMDKFD_IOC_DESTROY_QUEUE;" \
                     "queue offset %d\n", args->queue_id);
-            deviceForQueueId(args->queue_id).hsaPacketProc()
-                .unsetDeviceQueueDesc(args->queue_id, doorbellSize());
+            auto backend = queueIdToBackend.find(args->queue_id);
+            fatal_if(backend == queueIdToBackend.end(),
+                     "Destroying unknown KFD queue id %u\n",
+                     args->queue_id);
+            auto &hsa_pp = deviceForQueueId(args->queue_id).hsaPacketProc();
+            if (backend->second == QueueBackend::Compute) {
+                hsa_pp.unsetDeviceQueueDesc(args->queue_id, doorbellSize());
+            } else {
+                hsa_pp.unregisterSDMAQueue(args->queue_id);
+            }
             queueIdToDeviceIdx.erase(args->queue_id);
+            queueIdToBackend.erase(args->queue_id);
           }
           break;
         case AMDKFD_IOC_SET_MEMORY_POLICY:

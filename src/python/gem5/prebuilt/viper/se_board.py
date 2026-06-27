@@ -58,6 +58,19 @@ def _default_rocm_env(rocm: str = "/opt/rocm") -> List[str]:
     ]
 
 
+def _m5ops_base_after_ranges(memory_ranges) -> int:
+    return max(
+        [0xFFFF0000]
+        + [int(addr_range.end) for addr_range in memory_ranges]
+    )
+
+
+def _place_kvm_cores_on_device_event_queue(cores) -> None:
+    for core in cores:
+        if core.is_kvm_core():
+            core.get_simobject().eventq_index = 0
+
+
 class SEViperBoard(AbstractSystemBoard, SEBinaryWorkload):
     def __init__(
         self,
@@ -153,6 +166,10 @@ class SEViperBoard(AbstractSystemBoard, SEBinaryWorkload):
     def _connect_things(self) -> None:
         super()._connect_things()
 
+        _place_kvm_cores_on_device_event_queue(
+            self.processor.get_cores()
+        )
+
         host_cpu = self.processor.get_cores()[0].get_simobject()
         for gpu in self._gpus:
             gpu.set_cpu_pointer(host_cpu)
@@ -162,6 +179,12 @@ class SEViperBoard(AbstractSystemBoard, SEBinaryWorkload):
         for gpu_memory in self._gpu_memories:
             mem_ports.extend(gpu_memory.get_mem_ports())
         return mem_ports
+
+    def get_all_mem_interfaces(self):
+        mem_interfaces = list(self.memory.get_mem_interfaces())
+        for gpu_memory in self._gpu_memories:
+            mem_interfaces.extend(gpu_memory.get_mem_interfaces())
+        return mem_interfaces
 
     def get_gpu_mem_ports(self):
         ports = []
@@ -232,7 +255,7 @@ class SEViperBoard(AbstractSystemBoard, SEBinaryWorkload):
             process.useArchPT = True
 
         self.workload = SEWorkload.init_compatible(executable)
-        self.m5ops_base = max(0xFFFF0000, self.memory.get_size())
+        self.m5ops_base = _m5ops_base_after_ranges(self.mem_ranges)
         for core in self.processor.get_cores():
             core.set_workload(process)
 

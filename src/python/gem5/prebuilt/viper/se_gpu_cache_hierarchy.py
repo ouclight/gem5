@@ -432,6 +432,9 @@ class SEViperXGMICacheHierarchy(AbstractRubyCacheHierarchy):
         if not backing_ranges:
             raise ValueError("SE VIPER requires at least one memory range")
 
+        for mem_interface in board.get_all_mem_interfaces():
+            mem_interface.kvm_map = False
+
         backing_start = min(int(addr_range.start) for addr_range in backing_ranges)
         backing_end = max(int(addr_range.end) for addr_range in backing_ranges)
         self.ruby_system.access_backing_store = True

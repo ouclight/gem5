@@ -85,7 +85,9 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstring>
 #include <memory>
+#include <sstream>
 #include <string>
 
 #include "arch/generic/tlb.hh"
@@ -1886,6 +1888,63 @@ doClone(SyscallDesc *desc, ThreadContext *tc, RegVal flags, RegVal newStack,
 
     if (flags & OS::TGT_CLONE_CHILD_CLEARTID)
         cp->childClearTID = (uint64_t)ctidPtr;
+
+    if (p->kvmInSE) {
+        uint64_t child_stack_words[2] = {};
+        SETranslatingPortProxy(tc).readBlob(
+            newStack, child_stack_words, sizeof(child_stack_words));
+        Addr child_stack_paddr = 0;
+        const bool child_stack_translated =
+            p->pTable->translate(newStack, child_stack_paddr);
+        uint64_t physical_stack_words[2] = {};
+        if (child_stack_translated) {
+            p->system->physProxy.readBlob(
+                child_stack_paddr, physical_stack_words,
+                sizeof(physical_stack_words));
+        }
+        uint64_t kvm_stack_words[2] = {};
+        bool kvm_stack_found = false;
+        Addr kvm_backing_range_start = 0;
+        for (const auto &backing :
+                p->system->getPhysMem().getBackingStore()) {
+            if (!backing.kvmMap || !backing.range.contains(
+                    child_stack_paddr)) {
+                continue;
+            }
+            const Addr offset =
+                child_stack_paddr - backing.range.start();
+            std::memcpy(kvm_stack_words, backing.pmem + offset,
+                        sizeof(kvm_stack_words));
+            kvm_stack_found = true;
+            kvm_backing_range_start = backing.range.start();
+            break;
+        }
+        std::ostringstream trace;
+        trace << std::hex << std::showbase
+              << "KVM SE clone entry: parent_context=" << std::dec
+              << tc->contextId()
+              << " child_context=" << ctc->contextId()
+              << std::hex
+              << " flags=" << flags
+              << " new_stack=" << newStack
+              << " child_function=" << child_stack_words[0]
+              << " child_argument=" << child_stack_words[1]
+              << " stack_translated=" << std::dec
+              << child_stack_translated
+              << std::hex
+              << " stack_paddr=" << child_stack_paddr
+              << " physical_function=" << physical_stack_words[0]
+              << " physical_argument=" << physical_stack_words[1]
+              << " kvm_stack_found=" << std::dec
+              << kvm_stack_found
+              << std::hex
+              << " kvm_backing_start=" << kvm_backing_range_start
+              << " kvm_function=" << kvm_stack_words[0]
+              << " kvm_argument=" << kvm_stack_words[1]
+              << " tls=" << tlsPtr.addr()
+              << "\n";
+        inform("%s", trace.str());
+    }
 
     ctc->clearArchRegs();
 

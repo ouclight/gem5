@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #include "base/types.hh"
@@ -56,6 +57,7 @@ namespace gem5
 {
 
 class AMDGPUDevice;
+class SESDMAEngine;
 
 // Ideally, each queue should store this status and
 // the processPkt() should make decisions based on that
@@ -244,6 +246,7 @@ class HSAPacketProcessor: public DmaVirtDevice
     GPUCommandProcessor *gpu_device;
     HWScheduler *hwSchdlr;
     AMDGPUDevice *gpuDevice;
+    SESDMAEngine *sdmaEngine;
     VegaISA::Walker *walker;
 
     // Structure to store the read values of dependency signals
@@ -306,6 +309,7 @@ class HSAPacketProcessor: public DmaVirtDevice
     };
     // Keeps track of queueDescriptors of registered queues
     std::vector<class RQLEntry *> regdQList;
+    std::unordered_map<uint64_t, SESDMAEngine *> sdmaQueues;
 
     Q_STATE processPkt(void* pkt, uint32_t rl_idx, Addr host_pkt_addr);
     void displayQueueDescriptor(int pid, uint32_t rl_idx);
@@ -346,6 +350,10 @@ class HSAPacketProcessor: public DmaVirtDevice
                             GfxVersion gfxVersion,
                             Addr offset = 0, uint64_t rd_idx = 0);
     void unsetDeviceQueueDesc(uint64_t queue_id, int doorbellSize);
+    void registerSDMAQueue(uint64_t queue_id, uint64_t read_pointer,
+                           uint64_t write_pointer, uint64_t ring_base,
+                           uint32_t ring_size, int doorbellSize);
+    void unregisterSDMAQueue(uint64_t queue_id);
     void setDevice(GPUCommandProcessor * dev);
     void setGPUDevice(AMDGPUDevice *gpu_device);
     void updateReadIndex(int, uint32_t);

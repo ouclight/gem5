@@ -527,6 +527,18 @@ BaseKvmCPU::activateContext(ThreadID thread_num)
     baseStats.numCycles +=
         ticksToCycles(thread->lastActivate - thread->lastSuspend);
 
+    if (tc->getUseForClone()) {
+        // An SE clone initializes this idle CPU's ThreadContext from the
+        // parent. Preserve that authoritative state instead of overwriting it
+        // with the stale KVM state left from CPU startup.
+        kvmStateDirty = false;
+    } else {
+        // For an ordinary reactivation, preserve state produced by KVM while
+        // the context was running before forcing it back into KVM.
+        syncThreadContext();
+    }
+    tc->setUseForClone(false);
+    threadContextDirty = true;
     schedule(tickEvent, clockEdge(Cycles(0)));
     _status = Running;
 }

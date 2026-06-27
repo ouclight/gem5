@@ -18,6 +18,7 @@ from m5.objects import (
     RegisterFileCache,
     RegisterManager,
     ScalarRegisterFile,
+    SESDMAEngine,
     Shader,
     SimplePoolManager,
     TLBCoalescer,
@@ -164,11 +165,14 @@ class SEVegaGPU(Shader):
         self._gpu_dma_ports = []
         self._create_shared_tlbs()
 
+        self.se_sdma_engine = SESDMAEngine(gpuId=config.gpu_id)
+
         self.dispatcher = GPUDispatcher(kernel_exit_events=True)
         self.gpu_cmd_proc = GPUCommandProcessor(
             hsapp=HSAPacketProcessor(
                 pioAddr=config.hsapp_pio_addr,
                 numHWQueues=config.num_hw_queues,
+                sdmaEngine=self.se_sdma_engine,
             ),
             dispatcher=self.dispatcher,
         )
@@ -176,6 +180,7 @@ class SEVegaGPU(Shader):
 
         self._cpu_dma_ports.append(self.gpu_cmd_proc.hsapp.dma)
         self._cpu_dma_ports.append(self.gpu_cmd_proc.dma)
+        self._cpu_dma_ports.append(self.se_sdma_engine.dma)
 
     def _create_shared_tlbs(self):
         self.l2_tlb = X86GPUTLB(
@@ -234,3 +239,4 @@ class SEVegaGPU(Shader):
     def connect_iobus(self, iobus):
         self.gpu_cmd_proc.pio = iobus.mem_side_ports
         self.gpu_cmd_proc.hsapp.pio = iobus.mem_side_ports
+        self.se_sdma_engine.pio = iobus.mem_side_ports

@@ -38,6 +38,10 @@
 
 #include "arch/x86/linux/se_workload.hh"
 
+#include <array>
+#include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <sys/syscall.h>
 
 #include "arch/x86/linux/linux.hh"
@@ -155,23 +159,131 @@ void
 EmuLinux::pageFault(ThreadContext *tc)
 {
     Process *p = tc->getProcessPtr();
-    if (!p->fixupFault(tc->readMiscReg(misc_reg::Cr2))) {
-        SETranslatingPortProxy proxy(tc);
-        // at this point we should have 6 values on the interrupt stack
-        int size = 6;
-        size_t is_bytes = sizeof(uint64_t) * size;
-        auto is = std::make_unique<uint64_t[]>(size);
-        // reading the interrupt handler stack
-        proxy.readBlob(ISTVirtAddr + PageBytes - is_bytes, is.get(), is_bytes);
-        panic("Page fault at addr %#x\n\tInterrupt handler stack:\n"
-                "\tss: %#x\n"
-                "\trsp: %#x\n"
-                "\trflags: %#x\n"
-                "\tcs: %#x\n"
-                "\trip: %#x\n"
-                "\terr_code: %#x\n",
-                tc->readMiscReg(misc_reg::Cr2),
-                is[5], is[4], is[3], is[2], is[1], is[0]);
+    const Addr fault_addr = tc->readMiscReg(misc_reg::Cr2);
+    const bool mapped_before_fixup = p->pTable->lookup(fault_addr);
+    SETranslatingPortProxy proxy(tc);
+    // At this point we should have 6 values on the interrupt stack.
+    constexpr int interrupt_stack_entries = 6;
+    const size_t interrupt_stack_bytes =
+        sizeof(uint64_t) * interrupt_stack_entries;
+    auto is = std::make_unique<uint64_t[]>(interrupt_stack_entries);
+    proxy.readBlob(ISTVirtAddr + PageBytes - interrupt_stack_bytes,
+                   is.get(), interrupt_stack_bytes);
+
+    if (tc->contextId() != 0) {
+        std::ostringstream trace;
+        trace << "KVM SE page fault: context=" << tc->contextId()
+              << " pid=" << p->pid()
+              << std::hex << std::showbase
+              << " addr=" << fault_addr
+              << " rip=" << is[1]
+              << " rbx=" << tc->getReg(int_reg::Rbx)
+              << " rsp=" << is[4]
+              << " fs_base="
+              << tc->readMiscRegNoEffect(misc_reg::FsBase)
+              << "\n";
+        inform("%s", trace.str());
+    }
+
+    if (!p->fixupFault(fault_addr)) {
+        std::array<uint8_t, 16> instruction_bytes;
+        proxy.readBlob(is[1], instruction_bytes.data(),
+                       instruction_bytes.size());
+        uint64_t start_thread_saved_rdi = 0;
+        uint64_t start_thread_saved_rbx = 0;
+        std::array<uint64_t, 2> original_child_stack = {};
+        proxy.readBlob(is[4] + 0x8, &start_thread_saved_rdi,
+                       sizeof(start_thread_saved_rdi));
+        proxy.readBlob(is[4] + 0xa0, &start_thread_saved_rbx,
+                       sizeof(start_thread_saved_rbx));
+        proxy.readBlob(is[4] + 0xb0, original_child_stack.data(),
+                       sizeof(original_child_stack));
+        const auto read_kvm_backing = [p](Addr vaddr) {
+            Addr paddr = 0;
+            if (!p->pTable->translate(vaddr, paddr))
+                return uint64_t{0};
+
+            for (const auto &backing :
+                    p->system->getPhysMem().getBackingStore()) {
+                if (!backing.kvmMap || !backing.range.contains(paddr))
+                    continue;
+
+                uint64_t value = 0;
+                const Addr offset = paddr - backing.range.start();
+                std::memcpy(&value, backing.pmem + offset, sizeof(value));
+                return value;
+            }
+            return uint64_t{0};
+        };
+        const uint64_t kvm_start_thread_saved_rdi =
+            read_kvm_backing(is[4] + 0x8);
+        const uint64_t kvm_start_thread_saved_rbx =
+            read_kvm_backing(is[4] + 0xa0);
+        const uint64_t kvm_original_child_function =
+            read_kvm_backing(is[4] + 0xb0);
+        const uint64_t kvm_original_child_argument =
+            read_kvm_backing(is[4] + 0xb8);
+        std::ostringstream diagnostic;
+        diagnostic << std::hex << std::showbase
+                   << "Page fault at addr " << fault_addr
+                   << "\n\tInterrupt handler stack:"
+                   << "\n\tss: " << is[5]
+                   << "\n\trsp: " << is[4]
+                   << "\n\trflags: " << is[3]
+                   << "\n\tcs: " << is[2]
+                   << "\n\trip: " << is[1]
+                   << "\n\terr_code: " << is[0]
+                   << std::dec
+                   << "\n\tcontext_id: " << tc->contextId()
+                   << "\n\tpid: " << p->pid()
+                   << "\n\tpte_mapped_before_fixup: "
+                   << mapped_before_fixup
+                   << std::hex
+                   << "\n\tcr3: " << tc->readMiscReg(misc_reg::Cr3)
+                   << "\n\tfs_base: "
+                   << tc->readMiscRegNoEffect(misc_reg::FsBase)
+                   << "\n\tgs_base: "
+                   << tc->readMiscRegNoEffect(misc_reg::GsBase)
+                   << "\n\trax: " << tc->getReg(int_reg::Rax)
+                   << "\n\trbx: " << tc->getReg(int_reg::Rbx)
+                   << "\n\trcx: " << tc->getReg(int_reg::Rcx)
+                   << "\n\trdx: " << tc->getReg(int_reg::Rdx)
+                   << "\n\trbp: " << tc->getReg(int_reg::Rbp)
+                   << "\n\trsp: " << tc->getReg(int_reg::Rsp)
+                   << "\n\trdi: " << tc->getReg(int_reg::Rdi)
+                   << "\n\trsi: " << tc->getReg(int_reg::Rsi)
+                   << "\n\tr8: " << tc->getReg(int_reg::R8)
+                   << "\n\tr9: " << tc->getReg(int_reg::R9)
+                   << "\n\tr10: " << tc->getReg(int_reg::R10)
+                   << "\n\tr11: " << tc->getReg(int_reg::R11)
+                   << "\n\tr12: " << tc->getReg(int_reg::R12)
+                   << "\n\tr13: " << tc->getReg(int_reg::R13)
+                   << "\n\tr14: " << tc->getReg(int_reg::R14)
+                   << "\n\tr15: " << tc->getReg(int_reg::R15)
+                   << "\n\tstart_thread_saved_rdi: "
+                   << start_thread_saved_rdi
+                   << "\n\tstart_thread_saved_rbx: "
+                   << start_thread_saved_rbx
+                   << "\n\toriginal_child_function: "
+                   << original_child_stack[0]
+                   << "\n\toriginal_child_argument: "
+                   << original_child_stack[1]
+                   << "\n\tkvm_start_thread_saved_rdi: "
+                   << kvm_start_thread_saved_rdi
+                   << "\n\tkvm_start_thread_saved_rbx: "
+                   << kvm_start_thread_saved_rbx
+                   << "\n\tkvm_original_child_function: "
+                   << kvm_original_child_function
+                   << "\n\tkvm_original_child_argument: "
+                   << kvm_original_child_argument
+                   << "\n\tinstruction_bytes:";
+        diagnostic << std::noshowbase << std::setfill('0');
+        for (const auto byte : instruction_bytes) {
+            diagnostic << " " << std::setw(2)
+                       << static_cast<unsigned int>(byte);
+        }
+        diagnostic << "\n\tvmas:\n" << p->memState->printVmaList();
+        panic("%s", diagnostic.str());
    }
 }
 

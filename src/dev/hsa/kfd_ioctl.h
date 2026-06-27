@@ -44,10 +44,17 @@ struct kfd_ioctl_get_version_args
 	uint32_t minor_version;	/* from KFD */
 };
 
-/* For kfd_ioctl_create_queue_args.queue_type. */
-#define KFD_IOC_QUEUE_TYPE_COMPUTE	0
-#define KFD_IOC_QUEUE_TYPE_SDMA		1
-#define KFD_IOC_QUEUE_TYPE_COMPUTE_AQL	2
+/*
+ * For kfd_ioctl_create_queue_args.queue_type.
+ *
+ * These values must match the KFD ioctl UAPI, not hsakmt's public
+ * HSA_QUEUE_TYPE enum. libhsakmt converts HSA_QUEUE_TYPE values before
+ * issuing AMDKFD_IOC_CREATE_QUEUE, so the emulated ioctl receiver sees the
+ * compact KFD_IOC_QUEUE_TYPE_* values.
+ */
+#define KFD_IOC_QUEUE_TYPE_COMPUTE      0
+#define KFD_IOC_QUEUE_TYPE_SDMA         1
+#define KFD_IOC_QUEUE_TYPE_COMPUTE_AQL  2
 #define KFD_IOC_QUEUE_TYPE_SDMA_XGMI    3
 
 #define KFD_MAX_QUEUE_PERCENTAGE	100

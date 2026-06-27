@@ -39,6 +39,7 @@
 #include "base/logging.hh"
 #include "base/trace.hh"
 #include "debug/HSAPacketProcessor.hh"
+#include "dev/hsa/se_sdma_engine.hh"
 #include "dev/amdgpu/amdgpu_device.hh"
 #include "dev/dma_device.hh"
 #include "dev/hsa/hsa_packet.hh"
@@ -74,7 +75,8 @@ namespace gem5
 HSAPP_EVENT_DESCRIPTION_GENERATOR(QueueProcessEvent)
 
 HSAPacketProcessor::HSAPacketProcessor(const Params &p)
-    : DmaVirtDevice(p), walker(p.walker),
+    : DmaVirtDevice(p), gpu_device(nullptr), gpuDevice(nullptr),
+      sdmaEngine(p.sdmaEngine), walker(p.walker),
       numHWQueues(p.numHWQueues), pioAddr(p.pioAddr),
       pioSize(PAGE_SIZE), pioDelay(10), pktProcessDelay(p.pktProcessDelay)
 {
@@ -105,7 +107,49 @@ HSAPacketProcessor::setGPUDevice(AMDGPUDevice *gpu_device)
 void
 HSAPacketProcessor::unsetDeviceQueueDesc(uint64_t queue_id, int doorbellSize)
 {
+    DPRINTF(HSAPacketProcessor,
+            "unsetDeviceQueueDesc queue_id %lu doorbell_size %d\n",
+            queue_id, doorbellSize);
     hwSchdlr->unregisterQueue(queue_id, doorbellSize);
+}
+
+void
+HSAPacketProcessor::registerSDMAQueue(uint64_t queue_id,
+                                      uint64_t read_pointer,
+                                      uint64_t write_pointer,
+                                      uint64_t ring_base,
+                                      uint32_t ring_size,
+                                      int doorbellSize)
+{
+    DPRINTF(HSAPacketProcessor,
+            "registerSDMAQueue queue_id %lu ring_base %#lx ring_size %#x "
+            "read_ptr %#lx write_ptr %#lx doorbell_size %d\n",
+            queue_id, static_cast<uint64_t>(ring_base), ring_size,
+            static_cast<uint64_t>(read_pointer),
+            static_cast<uint64_t>(write_pointer), doorbellSize);
+
+    fatal_if(!sdmaEngine,
+             "SE SDMA queue %lu created without an attached SESDMAEngine\n",
+             queue_id);
+    sdmaEngine->registerQueue(queue_id, read_pointer, write_pointer,
+                              ring_base, ring_size, doorbellSize);
+    sdmaQueues[queue_id] = sdmaEngine;
+}
+
+void
+HSAPacketProcessor::unregisterSDMAQueue(uint64_t queue_id)
+{
+    auto it = sdmaQueues.find(queue_id);
+    if (it == sdmaQueues.end()) {
+        DPRINTF(HSAPacketProcessor,
+                "unregisterSDMAQueue queue_id %lu not registered\n",
+                queue_id);
+        return;
+    }
+    DPRINTF(HSAPacketProcessor,
+            "unregisterSDMAQueue queue_id %lu\n", queue_id);
+    it->second->unregisterQueue(queue_id);
+    sdmaQueues.erase(it);
 }
 
 void
@@ -117,8 +161,13 @@ HSAPacketProcessor::setDeviceQueueDesc(uint64_t hostReadIndexPointer,
                                        Addr offset, uint64_t rd_idx)
 {
     DPRINTF(HSAPacketProcessor,
-             "%s:base = %p, qID = %d, ze = %d\n", __FUNCTION__,
-             (void *)basePointer, queue_id, size);
+            "setDeviceQueueDesc queue_id %lu base %#lx size %#x "
+            "host_read_index_ptr %#lx doorbell_size %d gfx_version %d "
+            "offset %#lx rd_idx %lu\n",
+            queue_id, static_cast<uint64_t>(basePointer), size,
+            static_cast<uint64_t>(hostReadIndexPointer), doorbellSize,
+            static_cast<int>(gfxVersion), static_cast<uint64_t>(offset),
+            rd_idx);
     hwSchdlr->registerNewQueue(hostReadIndexPointer,
                                basePointer, queue_id, size, doorbellSize,
                                gfxVersion, offset, rd_idx);
@@ -150,17 +199,40 @@ HSAPacketProcessor::write(Packet *pkt)
 
     assert(gpu_device->driver()->doorbellSize() == pkt->getSize());
 
+    uint64_t raw_doorbell_reg(0);
     uint64_t doorbell_reg(0);
-    if (pkt->getSize() == 8)
-        doorbell_reg = pkt->getLE<uint64_t>() + 1;
-    else if (pkt->getSize() == 4)
-        doorbell_reg = pkt->getLE<uint32_t>();
+    if (pkt->getSize() == 8) {
+        raw_doorbell_reg = pkt->getLE<uint64_t>();
+        doorbell_reg = raw_doorbell_reg + 1;
+    } else if (pkt->getSize() == 4) {
+        raw_doorbell_reg = pkt->getLE<uint32_t>();
+        doorbell_reg = raw_doorbell_reg;
+    }
     else
         fatal("invalid db size");
 
+    const auto doorbell_size = gpu_device->driver()->doorbellSize();
+    const auto queue_id = daddr / doorbell_size;
+    auto sdma_queue = sdmaQueues.find(queue_id);
+
     DPRINTF(HSAPacketProcessor,
-            "%s: write data 0x%x to offset %d (0x%x)\n",
-            __FUNCTION__, doorbell_reg, daddr, daddr);
+            "doorbell route daddr %#lx doorbell_size %d queue_id %lu "
+            "raw_value %#lx adjusted_value %#lx sdma_hit %d "
+            "registered_sdma_queues %lu\n",
+            static_cast<uint64_t>(daddr), doorbell_size, queue_id,
+            raw_doorbell_reg, doorbell_reg, sdma_queue != sdmaQueues.end(),
+            static_cast<uint64_t>(sdmaQueues.size()));
+
+    if (sdma_queue != sdmaQueues.end()) {
+        DPRINTF(HSAPacketProcessor,
+                "doorbell route queue_id %lu to SESDMAEngine\n", queue_id);
+        sdma_queue->second->writeDoorbell(queue_id, doorbell_reg);
+        pkt->makeAtomicResponse();
+        return pioDelay;
+    }
+
+    DPRINTF(HSAPacketProcessor,
+            "doorbell route queue_id %lu to HWScheduler\n", queue_id);
     hwSchdlr->write(daddr, doorbell_reg);
     pkt->makeAtomicResponse();
     return pioDelay;

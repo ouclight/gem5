@@ -26,6 +26,36 @@ def _load_worktree_se_xgmi_network():
     return module
 
 
+def _load_worktree_se_gpu_cache_hierarchy():
+    module_name = (
+        "gem5.prebuilt.viper._se_gpu_cache_hierarchy_worktree_test"
+    )
+    module_path = Path(
+        "src/python/gem5/prebuilt/viper/se_gpu_cache_hierarchy.py"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_worktree_se_viper_board():
+    module_name = "gem5.prebuilt.viper._se_board_worktree_test"
+    module_path = Path("src/python/gem5/prebuilt/viper/se_board.py")
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class SEViperMultiGPUTest(unittest.TestCase):
     def test_default_gpu_nodes_scale_past_two_devices(self):
         nodes = default_xgmi_gpu_nodes(
@@ -299,6 +329,161 @@ class SEViperMultiGPUTest(unittest.TestCase):
         self.assertIn("board.mem_ranges", hierarchy)
         self.assertNotIn("PortTerminator", hierarchy)
         self.assertNotIn("_terminate_unused_controller_memory_ports", hierarchy)
+
+    def test_se_viper_ruby_backing_store_is_only_kvm_mapped_memory(self):
+        from m5.objects import SimpleMemory
+        from m5.params import AddrRange
+
+        module = _load_worktree_se_gpu_cache_hierarchy()
+
+        cpu_memory = SimpleMemory(range=AddrRange(0, size="3GiB"))
+        gpu0_memory = SimpleMemory(range=AddrRange("4GiB", size="1GiB"))
+        gpu1_memory = SimpleMemory(range=AddrRange("5GiB", size="1GiB"))
+
+        class FakeBoard:
+            mem_ranges = [
+                cpu_memory.range,
+                gpu0_memory.range,
+                gpu1_memory.range,
+            ]
+
+            @staticmethod
+            def get_all_mem_interfaces():
+                return [cpu_memory, gpu0_memory, gpu1_memory]
+
+        hierarchy = module.SEViperXGMICacheHierarchy()
+        hierarchy._configure_backing_store(FakeBoard())
+
+        for memory in FakeBoard.get_all_mem_interfaces():
+            self.assertFalse(memory.kvm_map.value)
+        self.assertTrue(hierarchy.ruby_system.phys_mem.kvm_map.value)
+
+    def test_se_viper_m5ops_range_follows_all_cpu_and_gpu_memory(self):
+        from m5.params import AddrRange
+
+        module = _load_worktree_se_viper_board()
+        memory_ranges = [
+            AddrRange(0, size="3GiB"),
+            AddrRange("4GiB", size="1GiB"),
+            AddrRange("5GiB", size="1GiB"),
+        ]
+
+        m5ops_base = module._m5ops_base_after_ranges(memory_ranges)
+        m5ops_range = AddrRange(m5ops_base, size="64KiB")
+
+        self.assertEqual(m5ops_base, 0x180000000)
+        for memory_range in memory_ranges:
+            self.assertGreaterEqual(
+                int(m5ops_range.start),
+                int(memory_range.end),
+            )
+
+    def test_se_viper_places_all_kvm_cores_on_device_event_queue(self):
+        module = _load_worktree_se_viper_board()
+
+        class FakeCore:
+            def __init__(self, eventq_index):
+                self.simobject = type(
+                    "FakeKvmCPU",
+                    (),
+                    {"eventq_index": eventq_index},
+                )()
+
+            @staticmethod
+            def is_kvm_core():
+                return True
+
+            def get_simobject(self):
+                return self.simobject
+
+        cores = [FakeCore(index) for index in range(1, 5)]
+
+        module._place_kvm_cores_on_device_event_queue(cores)
+
+        self.assertEqual(len(cores), 4)
+        self.assertEqual(
+            [core.get_simobject().eventq_index for core in cores],
+            [0, 0, 0, 0],
+        )
+
+    def test_kvm_context_activation_preserves_clone_state(self):
+        kvm_cpu = Path("src/cpu/kvm/base.cc").read_text()
+        activate_start = kvm_cpu.index("BaseKvmCPU::activateContext")
+        suspend_start = kvm_cpu.index(
+            "BaseKvmCPU::suspendContext",
+            activate_start,
+        )
+        activate_context = kvm_cpu[activate_start:suspend_start]
+
+        clone_branch = activate_context.index(
+            "if (tc->getUseForClone())"
+        )
+        discard_position = activate_context.index(
+            "kvmStateDirty = false",
+            clone_branch,
+        )
+        normal_branch = activate_context.index(
+            "} else {",
+            discard_position,
+        )
+        sync_position = activate_context.index(
+            "syncThreadContext()",
+            normal_branch,
+        )
+        clear_clone_position = activate_context.index(
+            "tc->setUseForClone(false)",
+            sync_position,
+        )
+        dirty_position = activate_context.index(
+            "threadContextDirty = true",
+            clear_clone_position,
+        )
+        schedule_position = activate_context.index(
+            "schedule(tickEvent"
+        )
+        self.assertLess(clone_branch, discard_position)
+        self.assertLess(discard_position, normal_branch)
+        self.assertLess(normal_branch, sync_position)
+        self.assertLess(sync_position, clear_clone_position)
+        self.assertLess(dirty_position, schedule_position)
+
+    def test_process_init_defers_clone_context_activation(self):
+        process = Path("src/sim/process.cc").read_text()
+        init_start = process.index("Process::initState()")
+        drain_start = process.index("Process::drain()", init_start)
+        init_state = process[init_start:drain_start]
+
+        clone_guard = init_state.index("if (!tc->getUseForClone())")
+        activate_position = init_state.index("tc->activate()", clone_guard)
+        page_table_position = init_state.index("pTable->initState()")
+
+        self.assertLess(clone_guard, activate_position)
+        self.assertLess(activate_position, page_table_position)
+
+    def test_x86_kvm_clone_single_step_diagnostic_is_removed(self):
+        base_cpu = Path("src/cpu/kvm/base.cc").read_text()
+        x86_cpu = Path("src/arch/x86/kvm/x86_cpu.cc").read_text()
+        x86_header = Path("src/arch/x86/kvm/x86_cpu.hh").read_text()
+
+        self.assertNotIn("case KVM_EXIT_DEBUG:", base_cpu)
+        self.assertNotIn("handleKvmExitDebug()", base_cpu)
+        self.assertNotIn("KVM_GUESTDBG", x86_cpu)
+        self.assertNotIn("KVM clone single-step", x86_cpu)
+        self.assertNotIn("autoSingleStep", x86_header)
+
+    def test_kvm_se_syscall_return_uses_vcpu_local_cr2_scratch(self):
+        process = Path("src/arch/x86/process.cc").read_text()
+        handler_start = process.index("/* System call handler */")
+        handler_end = process.index("/** Page fault handler */", handler_start)
+        handler = process[handler_start:handler_end]
+
+        self.assertNotIn("syscallDataBuf", handler)
+        self.assertNotIn("// push", handler)
+        self.assertNotIn("// pop", handler)
+        self.assertIn("// mov    %rax, %cr2", handler)
+        self.assertIn("// mov    %cr2, %rax", handler)
+        self.assertIn("0x0f, 0x22, 0xd0", handler)
+        self.assertIn("0x0f, 0x20, 0xd0", handler)
 
     def test_se_viper_board_redirects_rocm_filesystem_paths(self):
         board = Path("src/python/gem5/prebuilt/viper/se_board.py").read_text()
@@ -618,6 +803,272 @@ class SEViperMultiGPUTest(unittest.TestCase):
         ).read_text()
         self.assertIn("util/m5/src/abi/x86/m5op.S", makefile)
         self.assertIn("-I$(GEM5_ROOT)/include", makefile)
+
+    def test_direct_hsa_sdma_fill_smoke_uses_hsa_amd_memory_fill(self):
+        root = Path("tests/test-progs/gpu/xgmi-peer-vram")
+        source = (root / "hsa_sdma_fill.cpp").read_text()
+        makefile = (root / "Makefile").read_text()
+
+        self.assertIn("HSA_SDMA_FILL_TARGET", makefile)
+        self.assertIn("hsa_sdma_fill.cpp", makefile)
+        self.assertIn("$(HSA_SDMA_FILL_TARGET):", makefile)
+        self.assertIn("$(HSA_CXXFLAGS)", makefile)
+        self.assertIn("-lhsa-runtime64", makefile)
+        self.assertIn("-lhsakmt", makefile)
+
+        self.assertIn("hsa_init", source)
+        self.assertIn("hsa_iterate_agents", source)
+        self.assertIn("hsa_amd_agent_iterate_memory_pools", source)
+        self.assertIn("hsa_amd_memory_pool_allocate", source)
+        self.assertIn("hsa_amd_memory_fill", source)
+        self.assertIn("hsa_amd_memory_pool_free", source)
+        self.assertIn("HSA_SDMA_FILL_PASSED", source)
+        self.assertIn("[hsa_sdma_fill] begin hsa_amd_memory_fill", source)
+        self.assertNotIn("hipMemset", source)
+
+    def test_direct_hsa_sdma_async_copy_smoke_uses_hsa_amd_memory_async_copy(self):
+        root = Path("tests/test-progs/gpu/xgmi-peer-vram")
+        source = (root / "hsa_sdma_async_copy.cpp").read_text()
+        makefile = (root / "Makefile").read_text()
+
+        self.assertIn("HSA_SDMA_ASYNC_COPY_TARGET", makefile)
+        self.assertIn("hsa_sdma_async_copy.cpp", makefile)
+        self.assertIn("$(HSA_SDMA_ASYNC_COPY_TARGET):", makefile)
+        self.assertIn("$(HSA_CXXFLAGS)", makefile)
+        self.assertIn("-lhsa-runtime64", makefile)
+        self.assertIn("-lhsakmt", makefile)
+        self.assertIn("$(HSA_SDMA_ASYNC_COPY_TARGET)", makefile)
+
+        self.assertIn("hsa_init", source)
+        self.assertIn("hsa_iterate_agents", source)
+        self.assertIn("HSA_DEVICE_TYPE_CPU", source)
+        self.assertIn("HSA_DEVICE_TYPE_GPU", source)
+        self.assertIn("hsa_amd_agent_iterate_memory_pools", source)
+        self.assertIn("hsa_amd_memory_pool_allocate", source)
+        self.assertIn("hsa_amd_memory_async_copy", source)
+        self.assertIn("hsa_signal_create", source)
+        self.assertIn("hsa_signal_wait_scacquire", source)
+        self.assertIn("HSA_SIGNAL_CONDITION_LT", source)
+        self.assertIn("[hsa_sdma_async_copy] begin %s async copy", source)
+        self.assertIn('"H2D"', source)
+        self.assertIn('"D2H"', source)
+        self.assertIn("HSA_SDMA_ASYNC_COPY_PASSED", source)
+        self.assertNotIn("hsa_amd_memory_fill", source)
+        self.assertNotIn("hipMemcpy", source)
+        self.assertNotIn("hipMemset", source)
+
+    def test_direct_hsa_sdma_peer_async_copy_smoke_uses_two_gpus(self):
+        root = Path("tests/test-progs/gpu/xgmi-peer-vram")
+        source = (root / "hsa_sdma_peer_async_copy.cpp").read_text()
+        makefile = (root / "Makefile").read_text()
+
+        self.assertIn("HSA_SDMA_PEER_ASYNC_COPY_TARGET", makefile)
+        self.assertIn("hsa_sdma_peer_async_copy.cpp", makefile)
+        self.assertIn("$(HSA_SDMA_PEER_ASYNC_COPY_TARGET):", makefile)
+        self.assertIn("$(HSA_CXXFLAGS)", makefile)
+        self.assertIn("-lhsa-runtime64", makefile)
+        self.assertIn("-lhsakmt", makefile)
+        self.assertIn("$(HSA_SDMA_PEER_ASYNC_COPY_TARGET)", makefile)
+
+        self.assertIn("constexpr size_t CopyBytes = 64 * 1024", source)
+        self.assertIn("std::vector<hsa_agent_t> gpus", source)
+        self.assertIn("gpus.size() < 2", source)
+        self.assertIn("gpu0_pool", source)
+        self.assertIn("gpu1_pool", source)
+        self.assertIn("gpu0_data", source)
+        self.assertIn("gpu1_data", source)
+        self.assertIn("hsa_amd_memory_async_copy", source)
+        self.assertIn('"H2D_GPU0"', source)
+        self.assertIn('"GPU0_TO_GPU1"', source)
+        self.assertIn('"D2H_GPU1"', source)
+        self.assertIn("HSA_SDMA_PEER_ASYNC_COPY_PASSED", source)
+        self.assertNotIn("hipMemcpy", source)
+        self.assertNotIn("hipMemset", source)
+
+    def test_se_viper_gpu_exposes_sdma_dma_port(self):
+        se_viper_gpu = Path(
+            "src/python/gem5/components/devices/gpus/se_viper_gpu.py"
+        ).read_text()
+        hsa_device = Path("src/dev/hsa/HSADevice.py").read_text()
+        hsa_sconscript = Path("src/dev/hsa/SConscript").read_text()
+
+        self.assertIn("SESDMAEngine", hsa_device)
+        self.assertIn("SESDMAEngine", hsa_sconscript)
+        self.assertIn("Source('se_sdma_engine.cc')", hsa_sconscript)
+        self.assertIn("DebugFlag('SESDMAEngine')", hsa_sconscript)
+
+        self.assertIn("SESDMAEngine", se_viper_gpu)
+        self.assertIn("self.se_sdma_engine", se_viper_gpu)
+        self.assertIn("gpuId=config.gpu_id", se_viper_gpu)
+        self.assertIn(
+            "self._cpu_dma_ports.append(self.se_sdma_engine.dma)",
+            se_viper_gpu,
+        )
+
+    def test_kfd_queue_type_constants_match_ioctl_uapi(self):
+        kfd_ioctl = Path("src/dev/hsa/kfd_ioctl.h").read_text()
+        driver_hh = Path("src/gpu-compute/gpu_compute_driver.hh").read_text()
+        driver_cc = Path("src/gpu-compute/gpu_compute_driver.cc").read_text()
+        hsa_pp_hh = Path("src/dev/hsa/hsa_packet_processor.hh").read_text()
+
+        self.assertIn("KFD_IOC_QUEUE_TYPE_COMPUTE      0", kfd_ioctl)
+        self.assertIn("KFD_IOC_QUEUE_TYPE_SDMA         1", kfd_ioctl)
+        self.assertIn("KFD_IOC_QUEUE_TYPE_COMPUTE_AQL  2", kfd_ioctl)
+        self.assertIn("KFD_IOC_QUEUE_TYPE_SDMA_XGMI    3", kfd_ioctl)
+        self.assertIn("KFD ioctl UAPI", kfd_ioctl)
+        self.assertNotIn("HSA_QUEUE_TYPE ABI", kfd_ioctl)
+
+        self.assertIn("enum class QueueBackend", driver_hh)
+        self.assertIn("QueueBackend::Compute", driver_cc)
+        self.assertIn("QueueBackend::Sdma", driver_cc)
+        self.assertIn("queueIdToBackend", driver_hh)
+
+        self.assertIn("AMDKFD_IOC_CREATE_QUEUE request", driver_cc)
+        self.assertIn("AMDKFD_IOC_CREATE_QUEUE assigned", driver_cc)
+        self.assertIn("backend %s", driver_cc)
+        self.assertIn("doorbell_offset", driver_cc)
+        self.assertIn("write_pointer_address", driver_cc)
+
+        self.assertIn("KFD_IOC_QUEUE_TYPE_SDMA", driver_cc)
+        self.assertIn("registerSDMAQueue", driver_cc)
+        self.assertIn("unregisterSDMAQueue", driver_cc)
+        self.assertIn("registerSDMAQueue", hsa_pp_hh)
+        self.assertIn("unregisterSDMAQueue", hsa_pp_hh)
+
+        self.assertIn("KFD_IOC_QUEUE_TYPE_SDMA_XGMI", driver_cc)
+        self.assertNotIn("SE SDMA_XGMI queue is Phase 2", driver_cc)
+        self.assertIn('backend_name = "sdma_xgmi"', driver_cc)
+
+        sdma_case = driver_cc.index("KFD_IOC_QUEUE_TYPE_SDMA")
+        sdma_register = driver_cc.index("registerSDMAQueue", sdma_case)
+        next_compute_register = driver_cc.find(
+            "setDeviceQueueDesc", sdma_case, sdma_register
+        )
+        self.assertEqual(next_compute_register, -1)
+
+        sdma_xgmi_case = driver_cc.index("KFD_IOC_QUEUE_TYPE_SDMA_XGMI")
+        sdma_xgmi_register = driver_cc.index(
+            "registerSDMAQueue", sdma_xgmi_case
+        )
+        next_compute_register = driver_cc.find(
+            "setDeviceQueueDesc", sdma_xgmi_case, sdma_xgmi_register
+        )
+        self.assertEqual(next_compute_register, -1)
+
+    def test_hsa_packet_processor_routes_sdma_doorbells(self):
+        hsa_pp_hh = Path("src/dev/hsa/hsa_packet_processor.hh").read_text()
+        hsa_pp_cc = Path("src/dev/hsa/hsa_packet_processor.cc").read_text()
+        se_sdma_hh = Path("src/dev/hsa/se_sdma_engine.hh").read_text()
+        se_sdma_cc = Path("src/dev/hsa/se_sdma_engine.cc").read_text()
+
+        for symbol in (
+            "registerSDMAQueue",
+            "unregisterSDMAQueue",
+            "sdmaQueues",
+        ):
+            self.assertIn(symbol, hsa_pp_hh)
+            self.assertIn(symbol, hsa_pp_cc)
+
+        self.assertIn("writeDoorbell", se_sdma_hh)
+        self.assertIn("writeDoorbell", hsa_pp_cc)
+        self.assertIn("doorbell_size", hsa_pp_cc)
+        self.assertIn("queue_id = daddr / doorbell_size", hsa_pp_cc)
+        self.assertIn("sdmaQueues.find(queue_id)", hsa_pp_cc)
+        self.assertIn("registerSDMAQueue queue_id", hsa_pp_cc)
+        self.assertIn("setDeviceQueueDesc queue_id", hsa_pp_cc)
+        self.assertIn("doorbell route daddr", hsa_pp_cc)
+        self.assertIn("raw_value", hsa_pp_cc)
+        self.assertIn("adjusted_value", hsa_pp_cc)
+        self.assertIn("sdma_hit", hsa_pp_cc)
+        self.assertIn("to SESDMAEngine", hsa_pp_cc)
+        self.assertIn("to HWScheduler", hsa_pp_cc)
+        self.assertIn("first_ring_dword", se_sdma_cc)
+
+        sdma_lookup = hsa_pp_cc.index("sdmaQueues.find(queue_id)")
+        sdma_doorbell = hsa_pp_cc.index("writeDoorbell", sdma_lookup)
+        compute_doorbell = hsa_pp_cc.index("hwSchdlr->write", sdma_doorbell)
+        self.assertLess(sdma_doorbell, compute_doorbell)
+
+    def test_se_sdma_engine_has_phase1_packet_handlers(self):
+        se_sdma_hh = Path("src/dev/hsa/se_sdma_engine.hh").read_text()
+        se_sdma_cc = Path("src/dev/hsa/se_sdma_engine.cc").read_text()
+
+        for opcode in (
+            "SDMA_OP_NOP",
+            "SDMA_OP_FENCE",
+            "SDMA_OP_TRAP",
+            "SDMA_OP_POLL_REGMEM",
+            "SDMA_OP_CONST_FILL",
+            "SDMA_OP_COPY",
+            "SDMA_OP_ATOMIC",
+            "SDMA_ATOMIC_ADD64",
+            "SDMA_SUBOP_WRITE_LINEAR",
+            "SDMA_SUBOP_COPY_LINEAR",
+        ):
+            self.assertIn(opcode, se_sdma_cc)
+
+        for method in (
+            "processQueue",
+            "decodeHeader",
+            "finishPacket",
+            "executeFence",
+            "executeTrap",
+            "executePollRegMem",
+            "executePollRegMemData",
+            "pollRegMemFunc",
+            "executeConstFill",
+            "executeCopy",
+            "executeAtomic",
+            "executeAtomicData",
+            "dumpRingDwords",
+            "dumpRingDwordsData",
+            "writeDoorbell",
+            "translateRange",
+        ):
+            self.assertIn(method, se_sdma_cc)
+
+        self.assertIn("TranslationGenPtr translate", se_sdma_hh)
+        self.assertIn("dmaReadVirt", se_sdma_cc)
+        self.assertIn("dmaWriteVirt", se_sdma_cc)
+        self.assertIn("unsupported opcode", se_sdma_cc)
+        self.assertIn("unsupported WRITE sub-opcode", se_sdma_cc)
+        self.assertIn("unsupported COPY sub-opcode", se_sdma_cc)
+        self.assertIn("unsupported ATOMIC opcode", se_sdma_cc)
+        self.assertIn("unsupported POLL_REGMEM operation", se_sdma_cc)
+        self.assertIn("unsupported POLL_REGMEM comparison function", se_sdma_cc)
+        self.assertIn("if (header == 0)", se_sdma_cc)
+        self.assertIn("empty ring space", se_sdma_cc)
+        self.assertIn("queue.readIndex = queue.writeIndex", se_sdma_cc)
+        self.assertIn("dumpedDoorbellRing", se_sdma_hh)
+        self.assertIn("dumpedZeroHeaderRing", se_sdma_hh)
+        self.assertIn("lastDoorbellIndex", se_sdma_hh)
+        self.assertIn("last_doorbell", se_sdma_cc)
+        self.assertIn("doorbell ring base", se_sdma_cc)
+        self.assertIn("zero header neighborhood", se_sdma_cc)
+        self.assertIn("after unsupported WRITE variant", se_sdma_cc)
+        self.assertIn("SDMA ring dump queue", se_sdma_cc)
+
+        zero_header = se_sdma_cc.index("if (header == 0)")
+        header_advance = se_sdma_cc.index(
+            "advanceReadIndex(queue, sizeof(uint32_t))",
+            zero_header,
+        )
+        self.assertLess(zero_header, header_advance)
+
+    def test_se_sdma_engine_pio_port_is_connected_to_iobus(self):
+        se_viper_gpu = Path(
+            "src/python/gem5/components/devices/gpus/se_viper_gpu.py"
+        ).read_text()
+
+        connect_iobus = se_viper_gpu[
+            se_viper_gpu.index("def connect_iobus")
+        :]
+        self.assertIn("self.gpu_cmd_proc.pio = iobus.mem_side_ports",
+                      connect_iobus)
+        self.assertIn("self.gpu_cmd_proc.hsapp.pio = iobus.mem_side_ports",
+                      connect_iobus)
+        self.assertIn("self.se_sdma_engine.pio = iobus.mem_side_ports",
+                      connect_iobus)
 
 
 if __name__ == "__main__":
