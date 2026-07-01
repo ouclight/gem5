@@ -9866,3 +9866,4050 @@ Single next diagnostic step: if preparing to commit, run the structural
 pyunit checks again plus `git diff --check`, then review the changed file set
 and decide whether to include the generated smoke binaries/log directories in
 the commit scope or leave them untracked.
+
+## 2026-06-27 post-SDMA direction decision
+
+After the SDMA MVP commit, the user clarified the next work direction:
+
+- Continue the research-priority path first:
+  - multi-GPU interconnect/coherence investigation;
+  - remote-write-after-cache-read invalidation diagnostics.
+- Preserve the ROCm API coverage path as a future objective:
+  - `hipMalloc`;
+  - `hipMemcpy`;
+  - `hipMemset`;
+  - `hipLaunchKernel`;
+  - `hipFree`;
+  - broader ROCm API compatibility for application coverage.
+
+Rationale recorded:
+
+- SDMA was implemented to provide a reliable data-movement substrate for SE
+  multi-GPU work, especially H2D/D2H and GPU0-to-GPU1 peer async-copy.
+- The SDMA MVP is now validated by `hsa_sdma_async_copy` and
+  `hsa_sdma_peer_async_copy`.
+- The immediate research question is no longer whether peer data can be moved
+  at all. The next question is whether cached GPU-side observations remain
+  coherent after remote writes or SDMA/XGMI updates.
+- Full ROCm API support remains important for future application breadth, but
+  it should not block the next coherence diagnostic baseline.
+
+Accepted next work item:
+
+Build a direct HSA/HIP-style remote-write-after-cache-read diagnostic:
+
+1. GPU1 reads a GPU1-resident location to establish a cached observation.
+2. GPU0 or SDMA/XGMI updates that location or its backing buffer.
+3. GPU1 reads the location again.
+4. The test reports whether GPU1 observes the updated value or stale data.
+5. Trace the observed behavior before proposing invalidation/coherence fixes.
+
+Constraints:
+
+- Treat the first version as a diagnostic baseline, not as proof that
+  coherence already exists.
+- Do not assume an invalidation mechanism until the test demonstrates the
+  failing or passing behavior.
+- Preserve the future ROCm API track as separate follow-up work.
+
+Single next diagnostic step: design the smallest direct behavior test for
+remote-write-after-cache-read using the existing SE multi-GPU/SDMA foundation,
+then add the smoke source and structural pyunit coverage before running the
+full simulation.
+
+## 2026-06-27 remote-write-after-cache-read spec and plan
+
+The user confirmed the diagnostic design and clarified that GPU_VIPER should
+not be assumed to implement complete multi-GPU coherence. Codex wrote a spec
+and implementation plan only; no smoke source, gem5 build, or full simulation
+was started.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/writing-plans/SKILL.md
+sed -n '1,120p' AGENTS.md
+git status --short
+tail -160 docs/debug/se-multigpu-status.md
+sed -n '1,220p' docs/superpowers/specs/2026-06-24-se-sdma-mvp-design.md
+sed -n '1,220p' docs/superpowers/plans/2026-06-24-se-sdma-mvp.md
+sed -n '1,220p' tests/test-progs/gpu/xgmi-peer-invalidate/invalidate_kernels.hip
+sed -n '360,455p' tests/test-progs/gpu/xgmi-peer-invalidate/invalidate_hip.cpp
+```
+
+Files changed:
+
+- `docs/superpowers/specs/2026-06-27-remote-write-after-cache-read-design.md`
+- `docs/superpowers/plans/2026-06-27-remote-write-after-cache-read.md`
+- this status document.
+
+Facts recorded in the spec:
+
+- The first diagnostic must classify behavior, not assume coherence.
+- `updated` and `stale` are both valid diagnostic outcomes.
+- The target data pointer in the reader kernel should not be declared
+  `volatile`; only the control/synchronization buffer should use volatile
+  access.
+- The first implementation should use a GPU1 long-running reader dispatch and
+  a host-triggered GPU0-to-GPU1 SDMA_XGMI overwrite.
+
+Single next diagnostic step: review the new spec and plan. If accepted,
+implement the smoke source and structural pyunit test before running the full
+SE simulation.
+
+## 2026-06-27 remote-write-after-cache-read smoke implementation
+
+The user confirmed execution of the implementation plan. Codex implemented the
+first diagnostic smoke source and structural pyunit coverage. No long SE
+simulation was started in this step.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 CXX=g++
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+```
+
+First relevant results:
+
+- RED: the new pyunit initially failed with
+  `FileNotFoundError: ... hsa_remote_cache_read.cpp`, confirming the smoke was
+  not yet implemented.
+- The first build attempt failed with `make: hipcc: Command not found`; the
+  Makefile default `HIPCC ?= hipcc` requires either PATH setup or an explicit
+  `HIPCC=.../hipcc`.
+- Re-running the build with the `.deps` ROCm 4.0.1 `HIPCC` completed
+  successfully and produced:
+  - `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hsaco`
+  - `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read`
+
+Facts confirmed:
+
+- The new reader kernel uses a non-volatile target data pointer and volatile
+  control pointer.
+- The host smoke launches a GPU1 long-running reader kernel, waits for its
+  first read, issues a `GPU0_TO_GPU1_OVERWRITE` using
+  `hsa_amd_memory_async_copy`, then releases the reader for the second read.
+- Diagnostic outcomes are classified as:
+  - `REMOTE_CACHE_READ_PASSED_UPDATED`
+  - `REMOTE_CACHE_READ_OBSERVED_STALE`
+  - `REMOTE_CACHE_READ_FAILED_UNEXPECTED`
+- `updated` and `stale` are both treated as successful diagnostic completion;
+  only `unexpected` or timeouts are treated as smoke failures.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the first useful remote-write-after-cache-read test can be built
+  as a direct HSA smoke without depending on HIP `hipMemset`/`hipMemcpy`.
+- Accepted: this implementation only classifies observed behavior and does not
+  prove GPU_VIPER multi-GPU coherence.
+- Rejected: a full gem5 rebuild is needed for this source-only smoke step.
+
+Files changed:
+
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- `tests/test-progs/gpu/xgmi-peer-vram/Makefile`
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hip`
+- this status document.
+
+Verification completed:
+
+- Structural pyunit RED/GREEN for the new smoke.
+- Standalone ROCm 4.0.1 build of `hsa_remote_cache_read`.
+
+Generated local artifacts:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.bundle`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hsaco`
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read`
+
+Single next diagnostic step: run the new smoke under SE atomic with
+`SESDMAEngine` and `HSAPacketProcessor` debug enabled, then classify the result
+from stdout as updated, stale, unexpected, or timeout.
+
+## 2026-06-27 remote-write-after-cache-read first SE run
+
+The user ran the new smoke under SE atomic and asked Codex to inspect
+`m5out-hsa-remote-cache-read`.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type atomic --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read/simout.txt`
+- `m5out-hsa-remote-cache-read/simerr.txt`
+- `m5out-hsa-remote-cache-read/remote-cache.trace`
+
+First relevant observable result:
+
+- The run did not reach `REMOTE_CACHE_READ_RESULT`.
+- The program reached the GPU1 reader dispatch:
+  - `ring reader queue=0x7ffdec0cf000 index=0 doorbell=0x7ffdf658db80 kernel=0x7ffdf6602000`
+- The program did not reach host observation of `first_read_done` and did not
+  issue the planned `GPU0_TO_GPU1_OVERWRITE`.
+- gem5 aborted at tick `15274620756` with:
+  `panic: board.processor.cores0.core.dcache_port was not expecting a timing snoop request.`
+
+Facts confirmed by the trace:
+
+- Initial HSA setup completed and two GPU agents were discovered.
+- The initial SDMA H2D copies completed successfully before reader dispatch.
+- The reader dispatch went through a GPU1 compute queue:
+  - queue id 3;
+  - queue type 2;
+  - doorbell offset `0x18`;
+  - routed to `HWScheduler`, not `SESDMAEngine`, as expected for a kernel
+    dispatch.
+- The abort occurred before the remote overwrite phase, so no stale/updated
+  classification is available from this run.
+- The panic stack in `simerr.txt` shows:
+  - `GPU_VIPER::CorePair_Controller::forward_eviction_to_cpu0`
+  - `RubyPort::ruby_eviction_callback`
+  - `RequestPort::recvTimingSnoopReq`
+  - atomic CPU dcache port rejection of a timing snoop request.
+
+Hypotheses accepted or rejected:
+
+- Accepted: Atomic CPU is not a valid execution mode for this particular
+  Ruby/GPU_VIPER coherence diagnostic once the protocol sends CPU snoops.
+- Rejected: the failure was caused by SDMA_XGMI overwrite handling; that
+  overwrite was not reached.
+- Rejected: the smoke produced either a stale or updated remote-cache result in
+  this run; it aborted before the classification point.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, and trace.
+- Confirmed failure point and that the intended remote overwrite was not
+  reached.
+
+Single next diagnostic step: rerun the same smoke with `--cpu-type timing`
+using the same debug flags and output directory name such as
+`m5out-hsa-remote-cache-read-timing`; then inspect whether the run reaches
+`first_read_done`, `GPU0_TO_GPU1_OVERWRITE`, and `REMOTE_CACHE_READ_RESULT`.
+
+## 2026-06-27 remote-write-after-cache-read timing SE run
+
+The user reran the smoke with `--cpu-type timing` and asked Codex to inspect
+`m5out-hsa-remote-cache-read-timing`.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-timing -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read-timing/simout.txt`
+- `m5out-hsa-remote-cache-read-timing/simerr.txt`
+- `m5out-hsa-remote-cache-read-timing/remote-cache.trace`
+
+First relevant observable result:
+
+- Timing CPU avoided the earlier Atomic CPU timing-snoop panic.
+- The smoke reached:
+  - `observed first_read_done=1 after 1066 host polls`
+  - `begin GPU0_TO_GPU1_OVERWRITE async copy bytes=4`
+  - `wait GPU0_TO_GPU1_OVERWRITE completion`
+  - `wait completion: HSA_STATUS_SUCCESS`
+- The run did not reach `REMOTE_CACHE_READ_RESULT`.
+- gem5 aborted at tick `23312340324` with:
+  `Invalid transition ... addr: 0x1b1a080 event: L3Hit state: BDW_M`.
+
+Facts confirmed by the trace:
+
+- The reader kernel ran far enough to set `first_read_done`.
+- The host-triggered GPU0-to-GPU1 overwrite used an SDMA_XGMI queue:
+  - GPU0 queue id 4;
+  - queue type 3;
+  - backend `sdma_xgmi`;
+  - doorbell offset `0x20`;
+  - routed to `SESDMAEngine`.
+- The SDMA_XGMI queue drained successfully at rptr 84 after its completion
+  atomic:
+  - `SDMA atomic ADD64 queue 4 ... new 0`
+  - `SDMA queue 4 drained at rptr 84`
+- The panic address is not the target data location. It maps to GPU1 reader
+  compute queue metadata:
+  - PA `0x1b1a000` was allocated for VA `0x7ffdec0cf000`;
+  - queue id 3 used `host_read_index_ptr 0x7ffdec0cf080`;
+  - panic address `0x1b1a080` is exactly that read-index pointer page plus
+    offset `0x80`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: `--cpu-type timing` is required for this diagnostic when Ruby sends
+  CPU snoops.
+- Accepted: the first remote-cache smoke is now reaching the real
+  remote-overwrite phase.
+- Accepted: the current blocking failure is a GPU_VIPER directory protocol
+  transition gap on shared HSA queue metadata, not a failure of SDMA_XGMI
+  routing.
+- Rejected: the timing run produced a stale/updated classification; it aborted
+  before the reader completed its second read and classification.
+- Rejected: the panic address is `gpu1_target`; it is the GPU1 compute queue
+  read-index metadata.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, and trace.
+- Address correlation from panic PA `0x1b1a080` to queue metadata VA
+  `0x7ffdec0cf080`.
+- Confirmation that SDMA_XGMI overwrite completed before the panic.
+
+Single next diagnostic step: add narrowly scoped Ruby debug flags for the same
+Timing run, focused on `Directory`, `RubyPort`, and `ProtocolTrace`, to capture
+the request source and transition sequence for PA `0x1b1a080`; then decide
+whether the immediate workaround should bypass queue-metadata coherence or add
+a minimal GPU_VIPER transition for `L3Hit` in `BDW_M`.
+
+## 2026-06-27 broad Ruby protocol trace attempt
+
+The user reran the smoke with broad Ruby protocol debug enabled and interrupted
+the run because the trace grew too large. Codex inspected
+`m5out-hsa-remote-cache-read-timing`.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-timing -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,ProtocolTrace,RubyProtocol,RubyPort,RubySlicc --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+First relevant observable result:
+
+- The run exited at tick `2584090323` because of user interrupt.
+- `remote-cache.trace` reached about 3.15 GB.
+- `simout.txt` did not contain `hsa_remote_cache_read` program output.
+- Targeted trace search found only SDMA engine creation at tick 0 and no KFD,
+  queue, reader, overwrite, panic, or `REMOTE_CACHE` events.
+
+Facts confirmed:
+
+- Enabling `ProtocolTrace,RubyProtocol,RubyPort,RubySlicc` from tick 0 is too
+  verbose for this workload and does not reach the diagnostic phase before the
+  log becomes impractical.
+- gem5 supports `--debug-start=TICK` and `--debug-end=TICK`, confirmed by:
+  `build/VEGA_X86/gem5.opt --help | rg -n "debug-(start|end|flags|file)"`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the next Ruby protocol trace must use a tick window around the
+  known failure region.
+- Rejected: the interrupted 3.15 GB trace contains useful evidence for the
+  HSA queue metadata invalid transition; the run did not reach that phase.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Inspected `simout.txt`, `simerr.txt`, and targeted trace keywords.
+- Confirmed no `hsa_remote_cache_read`, KFD queue, overwrite, or panic evidence
+  was present in the interrupted trace.
+
+Single next diagnostic step: rerun Timing with the same broad Ruby debug flags
+but add a narrow debug window around the known prior failure region, e.g.
+`--debug-start=21000000000 --debug-end=23500000000`, or start even tighter near
+`22000000000` if the previous timing run is reproducible.
+
+## 2026-06-27 windowed Ruby protocol trace for queue metadata failure
+
+The user reran the Timing smoke with a debug window and broad Ruby protocol
+flags, then asked Codex to inspect
+`m5out-hsa-remote-cache-read-timing-window`.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-timing-window -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,ProtocolTrace,RubyProtocol,RubyPort,RubySlicc --debug-start=21000000000 --debug-end=23500000000 --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read-timing-window/simout.txt`
+- `m5out-hsa-remote-cache-read-timing-window/simerr.txt`
+- `m5out-hsa-remote-cache-read-timing-window/remote-cache.trace`
+
+First relevant observable result:
+
+- The windowed trace reproduced the same Timing failure:
+  `Invalid transition ... addr: 0x1b1a080 event: L3Hit state: BDW_M`.
+- The run reached:
+  - `observed first_read_done=1 after 1066 host polls`
+  - `begin GPU0_TO_GPU1_OVERWRITE async copy bytes=4`
+  - `wait GPU0_TO_GPU1_OVERWRITE completion`
+
+Facts confirmed by the protocol trace:
+
+- At tick `23312323674`, directory controller 0 accepted a DMA write for
+  `0x1b1a080`:
+  - `Directory DmaWrite U>BDW_PM [0x1b1a080]`
+  - it sent `PrbInv` to both CPU core-pair destinations.
+- At tick `23312326005`, both CorePair controllers processed `PrbInvData`
+  for `0x1b1a080` and sent invalidations to their CPU sequencers.
+- At ticks `23312328336` and `23312328669`, directory controller 0 received
+  the two `CPUPrbResp` acks:
+  - first `Acks remaining: 1`
+  - then `Acks remaining: 0`
+- At tick `23312329002`, `ProbeAcksComplete` transitioned:
+  - `Directory ProbeAcksComplete BDW_PM>BDW_M [0x1b1a080]`
+- A later L3 hit trigger for the same DMA write arrived while the directory
+  state was already `BDW_M`, causing the generated invalid transition panic.
+
+Source inspection:
+
+- `src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm` defines:
+  - `transition(BDW_PM, L3Hit, BDW_Pm) { ptl_popTriggerQueue; }`
+  - `transition(BDW_PM, ProbeAcksComplete, BDW_M) { pt_popTriggerQueue; }`
+  - `transition(BDW_M, MemData, U) { mt_writeMemDataToTBE; wd_writeBackData; da_sendResponseDmaAck; wada_wakeUpAllDependentsAddr; dt_deallocateTBE; pm_popMemQueue; }`
+  - `transition(BDW_Pm, ProbeAcksComplete, U) { wd_writeBackData; da_sendResponseDmaAck; wada_wakeUpAllDependentsAddr; dt_deallocateTBE; pt_popTriggerQueue; }`
+- It does not define `transition(BDW_M, L3Hit, ...)`.
+- For a DMA write L3 hit, `qdr_queueDmaRdReq` merges the old L3 block with
+  the partial DMA write data into `tbe.DataBlk`, sets `tbe.L3Hit := true`,
+  sets `tbe.MemData := true`, deallocates the L3 cache line, and enqueues an
+  `L3Hit` trigger. Therefore if CPU probe acks arrive before the delayed
+  L3-hit trigger, `BDW_PM` becomes `BDW_M`, and the later `L3Hit` needs a
+  legal completion path.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the panic is a race/order hole between `ProbeAcksComplete` and the
+  delayed `L3Hit` trigger for a DMA write that hits in L3.
+- Accepted: the minimal protocol gap is specifically missing
+  `BDW_M + L3Hit`.
+- Rejected: this failure is caused by the remote target data line; the address
+  remains GPU1 compute queue metadata read-index memory.
+- Rejected: adding more trace from tick 0 is useful; the windowed trace already
+  captures the required transition sequence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Windowed trace inspection around `0x1b1a080`.
+- Protocol source inspection of `BDW_PM`, `BDW_M`, `BDW_Pm`, `L3Hit`,
+  `ProbeAcksComplete`, and DMA write actions.
+
+Single next diagnostic step: implement the minimal directory transition for
+`BDW_M + L3Hit` in `src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm`, using the
+same completion actions as the DMA-write L3-hit/probe-complete path but popping
+the L3 trigger queue; then rebuild gem5 and rerun the Timing smoke without
+broad Ruby tracing.
+
+## 2026-06-27 BDW_M + delayed L3Hit protocol fix
+
+The user asked Codex to execute the fix for the queue-metadata DMA-write
+failure identified by the windowed Ruby protocol trace. Codex implemented a
+minimal directory protocol transition and structural regression coverage. No
+long gem5 rebuild or full SE simulation was started in this step.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+```
+
+After adding the protocol transition, Codex reran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+```
+
+Then Codex ran the related structural checks and diff whitespace check:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+git diff --check
+```
+
+First relevant observable result:
+
+- The new pyunit check failed before the protocol edit because
+  `MOESI_AMD_Base-dir.sm` did not contain `transition(BDW_M, L3Hit, U)`.
+- After the protocol edit, the focused test passed.
+- The two related structural pyunit tests passed.
+- `git diff --check` produced no whitespace errors.
+
+Facts confirmed:
+
+- The protocol now has a legal completion path for the trace-observed ordering:
+  `DmaWrite U>BDW_PM`, CPU probe acknowledgements complete first
+  (`BDW_PM>BDW_M`), then the delayed `L3Hit` trigger arrives in `BDW_M`.
+- The new `BDW_M + L3Hit -> U` path writes the already-merged TBE data back,
+  sends the DMA acknowledgement, wakes dependents, deallocates the TBE, and
+  pops the L3 trigger queue with `ptl_popTriggerQueue`.
+- The transition intentionally does not call `mt_writeMemDataToTBE`, because
+  this is not a memory-response path; `qdr_queueDmaRdReq` already merged the
+  DMA write data into the TBE before enqueuing the delayed `L3Hit`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the immediate protocol hole can be addressed by a minimal
+  `BDW_M + L3Hit` transition rather than by broad queue-metadata bypass logic.
+- Accepted: this source-level fix must be followed by a gem5 rebuild because
+  `.sm` changes regenerate compiled SLICC protocol code.
+- Rejected: the structural pyunit passing is sufficient proof of the full
+  remote-cache smoke behavior. The full Timing simulation still needs to be
+  rerun after rebuild.
+
+Files changed:
+
+- `src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- RED/GREEN structural pyunit for the missing transition.
+- Related remote-cache smoke structural pyunit.
+- `git diff --check`.
+
+Single next diagnostic step: rebuild gem5, then rerun the Timing
+`hsa_remote_cache_read` smoke without broad Ruby protocol tracing and inspect
+whether it passes the previous `BDW_M + L3Hit` panic point and reaches
+`REMOTE_CACHE_READ_RESULT`.
+
+## 2026-06-29 remote-cache smoke after BDW_M + L3Hit fix
+
+The user rebuilt gem5, reran the Timing `hsa_remote_cache_read` smoke after
+the `BDW_M + L3Hit` protocol fix, and asked Codex to inspect
+`m5out-hsa-remote-cache-read-after-bdw-l3hit`.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-after-bdw-l3hit -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read-after-bdw-l3hit/simout.txt`
+- `m5out-hsa-remote-cache-read-after-bdw-l3hit/simerr.txt`
+- `m5out-hsa-remote-cache-read-after-bdw-l3hit/remote-cache.trace`
+- `m5out-hsa-remote-cache-read-after-bdw-l3hit/stats.txt`
+
+First relevant observable result:
+
+- The run passed the previous `Invalid transition ... event: L3Hit state:
+  BDW_M` failure point.
+- The smoke reached:
+  - `observed first_read_done=1 after 1066 host polls`
+  - `begin GPU0_TO_GPU1_OVERWRITE async copy bytes=4`
+  - `wait GPU0_TO_GPU1_OVERWRITE completion`
+  - `observed reader_done=1 after 161 host polls`
+  - `REMOTE_CACHE_READ_RESULT first=0x11112222 second=0x33334444 classification=1`
+  - `REMOTE_CACHE_READ_PASSED_UPDATED`
+- gem5 exited normally:
+  `Exiting @ tick 23686138818 because exiting with last active thread context.`
+
+Facts confirmed:
+
+- The old queue-metadata protocol panic is no longer present in this run.
+- `remote-cache.trace` shows the GPU0 SDMA_XGMI queue for the overwrite:
+  - queue id 4;
+  - queue type 3;
+  - routed to `SESDMAEngine`;
+  - doorbell offset `0x20`;
+  - `SDMA queue 4 drained at rptr 84`.
+- The SDMA completion atomic ran:
+  - `SDMA atomic ADD64 queue 4 ... old 0x1 ... new 0`.
+- `stats.txt` confirms the new protocol transition was exercised:
+  - `Directory_Controller.BDW_M.L3Hit::total 2`.
+- Final stats also show the two DMA writes completed through the DMA
+  controller:
+  - `Directory_Controller.DmaWrite::total 2`;
+  - `DMA_Controller.Ack::total 2`.
+- The smoke classified the second GPU1 read as updated, not stale:
+  - first read `0x11112222`;
+  - second read `0x33334444`;
+  - classification `1`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the minimal `BDW_M + L3Hit` transition fixes the specific
+  directory protocol ordering hole reproduced by the prior windowed trace.
+- Accepted: this smoke now demonstrates remote write after prior GPU1 read can
+  complete and observe the updated value for this single-line diagnostic.
+- Rejected: the previous `BDW_M + L3Hit` panic remains the current blocker.
+- Not proven: full multi-GPU cache coherence is complete. This is one focused
+  diagnostic; broader cases still need coverage.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, SDMA trace, and protocol stats.
+- Confirmed normal simulator exit and `REMOTE_CACHE_READ_PASSED_UPDATED`.
+- Confirmed the new `BDW_M.L3Hit` transition was actually counted in stats.
+
+Single next diagnostic step: add or run a second remote-cache variant to avoid
+overfitting this single case, such as repeated remote overwrites around the same
+GPU1-read line or a reverse-direction GPU1-to-GPU0 remote-write-after-cache-read
+smoke, then compare whether all variants still classify as updated without new
+Ruby protocol panics.
+
+## 2026-06-29 repeated remote-cache smoke variant implementation
+
+The user asked Codex to execute the next diagnostic step. Codex implemented a
+second remote-cache variant in the existing `hsa_remote_cache_read` binary. No
+long gem5 simulation was started in this step.
+
+Chosen variant:
+
+- Reuse the existing GPU1 reader kernel and direct HSA host harness.
+- Preserve the default single-round behavior.
+- Add `--mode repeated` to run two same-address remote-write-after-cache-read
+  rounds on the same GPU1 target:
+  - round 0: `0x11112222 -> 0x33334444`;
+  - round 2: `0x33334444 -> 0x55556666`.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+First relevant result:
+
+- RED: the structural test failed as expected because the source did not yet
+  contain `--mode` or the repeated-mode result markers.
+
+After implementation, Codex ran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+Result: the structural test passed.
+
+Codex rebuilt the smoke binary:
+
+```bash
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+```
+
+Result: `hsa_remote_cache_read` compiled and linked successfully.
+
+Codex then ran the related structural checks:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+git diff --check
+```
+
+Result:
+
+- both pyunit tests passed;
+- `git diff --check` produced no whitespace errors.
+
+Facts confirmed:
+
+- `hsa_remote_cache_read` now accepts `--mode repeated`.
+- Default no-argument behavior remains the single-round diagnostic.
+- Repeated mode prints per-round results with
+  `REMOTE_CACHE_READ_REPEATED_ROUND`.
+- Repeated mode reports:
+  - `REMOTE_CACHE_READ_REPEATED_PASSED_UPDATED` when both rounds classify as
+    updated;
+  - `REMOTE_CACHE_READ_REPEATED_OBSERVED_STALE` if either completed round
+    classifies as stale;
+  - `REMOTE_CACHE_READ_REPEATED_FAILED_UNEXPECTED` for unexpected values or
+    execution errors.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the lowest-risk second diagnostic is repeated overwrite/read on
+  the same GPU1 line, because it stresses the same coherence path without
+  adding reverse-direction routing variables yet.
+- Rejected: a new binary or new kernel is required for this variant; the
+  existing reader kernel can be reused with different expected values.
+
+Files changed:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- TDD RED/GREEN structural pyunit.
+- Standalone ROCm 4.0.1 rebuild of `hsa_remote_cache_read`.
+- Related structural pyunit plus `git diff --check`.
+
+Single next diagnostic step: run the repeated variant under Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-repeated -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read --opts='--mode repeated' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspect whether both `REMOTE_CACHE_READ_REPEATED_ROUND` lines classify as
+updated, whether `REMOTE_CACHE_READ_REPEATED_PASSED_UPDATED` appears, and
+whether any new Ruby protocol panic occurs.
+
+## 2026-06-29 repeated remote-cache Timing run
+
+The user ran the repeated remote-cache variant and asked Codex to inspect
+`m5out-hsa-remote-cache-read-repeated`.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-repeated -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode repeated' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read-repeated/simout.txt`
+- `m5out-hsa-remote-cache-read-repeated/simerr.txt`
+- `m5out-hsa-remote-cache-read-repeated/remote-cache.trace`
+- `m5out-hsa-remote-cache-read-repeated/stats.txt`
+
+First relevant observable result:
+
+- The run completed both remote-write-after-cache-read rounds and exited
+  normally:
+  `Exiting @ tick 23775396138 because exiting with last active thread context.`
+- Round 0 produced:
+  `REMOTE_CACHE_READ_RESULT first=0x11112222 second=0x33334444 classification=1`.
+- Round 2 produced:
+  `REMOTE_CACHE_READ_REPEATED_ROUND round=2 first=0x33334444 second=0x55556666 classification=1`.
+- The final result was:
+  `REMOTE_CACHE_READ_REPEATED_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- No `panic`, `fatal`, or `Invalid transition` string was found in
+  `simout.txt`, `simerr.txt`, or `remote-cache.trace`.
+- The GPU1 compute queue accepted two reader dispatches on the same queue:
+  - first dispatch at queue index 0;
+  - second dispatch at queue index 1.
+- The first GPU0-to-GPU1 overwrite completed through SDMA queue 4:
+  - `SDMA atomic ADD64 queue 4 ... old 0x1 ... new 0`;
+  - `SDMA queue 4 drained at rptr 84`.
+- The second GPU0-to-GPU1 overwrite completed through the same SDMA queue 4:
+  - `SDMA atomic ADD64 queue 4 ... old 0x1 ... new 0`;
+  - `SDMA queue 4 drained at rptr 168`.
+- The final stats section shows the two repeated-mode DMA writes and acks:
+  - `Directory_Controller.DmaWrite::total 2`;
+  - `DMA_Controller.Ack::total 2`.
+- Because stats were dumped/reset multiple times during the run, an earlier
+  stats section also contains `Directory_Controller.BDW_M.L3Hit::total 1`,
+  while the final section records `Directory_Controller.BDW_M.MemData::total 2`.
+  The important observed behavior is that both DMA writes completed and the
+  run did not hit a protocol invalid transition.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the single-round updated result was not merely a one-off outcome;
+  two sequential same-address remote overwrite/read rounds both classified as
+  updated.
+- Accepted: the current `BDW_M + L3Hit` protocol fix remains compatible with
+  repeated same-line remote writes in this focused SDMA_XGMI path.
+- Rejected: the repeated variant exposes a new Ruby protocol panic in the
+  tested path.
+- Not proven: full multi-GPU coherence for shader stores, reverse direction,
+  multiple lanes, or broader cache-state combinations.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, SDMA trace, and Ruby stats.
+- Confirmed both repeated-mode rounds classified as updated.
+- Confirmed normal simulator exit and no panic/fatal/invalid-transition text.
+
+Single next diagnostic step: add a reverse-direction diagnostic
+GPU1-to-GPU0 remote-write-after-cache-read, using the same direct HSA structure
+but swapping source/target GPU roles, then run it under Timing CPU to determine
+whether the path is symmetric or exposes GPU1-to-GPU0 routing/protocol gaps.
+
+## 2026-06-29 reverse remote-cache smoke implementation
+
+The user accepted the next diagnostic step. Codex implemented a reverse
+remote-write-after-cache-read variant in the existing `hsa_remote_cache_read`
+binary. No long gem5 simulation was started in this step.
+
+Chosen variant:
+
+- Preserve the default single-round GPU0-to-GPU1 mode.
+- Preserve `--mode repeated`.
+- Add `--mode reverse` to swap the source/target roles:
+  - GPU0 becomes the reader and target allocation owner;
+  - GPU1 becomes the source/writer allocation owner;
+  - the same `remote_cache_reader` kernel is loaded for GPU0;
+  - the overwrite label is `GPU1_TO_GPU0_OVERWRITE`.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+First relevant result:
+
+- RED: the structural test failed as expected because the source did not yet
+  contain reverse-mode markers such as `REMOTE_CACHE_READ_REVERSE_RESULT` and
+  `GPU1_TO_GPU0_OVERWRITE`.
+
+After implementation, Codex reran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+Result: the structural test passed.
+
+Codex rebuilt the smoke binary:
+
+```bash
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+```
+
+Result: `hsa_remote_cache_read` compiled and linked successfully.
+
+Codex then ran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+git diff --check
+```
+
+Result:
+
+- both pyunit tests passed;
+- `git diff --check` produced no whitespace errors.
+
+Codex also checked that the rebuilt artifacts contain the new mode strings and
+writer kernel symbol:
+
+```bash
+strings tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read | rg "shader-store|SHADER_STORE|remote_cache_writer"
+strings tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hsaco | rg "remote_cache_writer|remote_cache_reader"
+```
+
+Result: the binary contains the `shader-store`/`reverse-shader-store` mode
+strings and result markers, and the HSACO contains `remote_cache_writer@kd`.
+
+Facts confirmed:
+
+- `hsa_remote_cache_read` now accepts `--mode reverse`.
+- Reverse mode selects:
+  - `reader_agent = gpu0`;
+  - `source_agent = gpu1`;
+  - `target_agent = gpu0`;
+  - `source = gpu1_target`;
+  - `target = gpu0_source`.
+- Reverse mode loads the same code object for the reader agent and creates the
+  reader queue on GPU0.
+- Reverse mode prints:
+  - `REMOTE_CACHE_READ_REVERSE_RESULT`;
+  - `REMOTE_CACHE_READ_REVERSE_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_REVERSE_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_REVERSE_FAILED_UNEXPECTED`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: a reverse-direction diagnostic can reuse the same kernel and HSA
+  harness by swapping source/target/reader roles.
+- Accepted: no gem5 rebuild is required for this source-only smoke change; the
+  HSA test binary rebuild is sufficient.
+- Not tested yet: whether the GPU1-to-GPU0 path is symmetric under full Timing
+  simulation.
+
+Files changed:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- TDD RED/GREEN structural pyunit.
+- Standalone ROCm 4.0.1 rebuild of `hsa_remote_cache_read`.
+- Related structural pyunit plus `git diff --check`.
+- Rebuilt binary/HSACO symbol-string check for the shader-store mode and
+  `remote_cache_writer@kd`.
+
+Single next diagnostic step: run the reverse variant under Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read --opts='--mode reverse' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspect whether `REMOTE_CACHE_READ_REVERSE_RESULT` classifies as updated,
+whether `REMOTE_CACHE_READ_REVERSE_PASSED_UPDATED` appears, and whether any
+new Ruby protocol panic occurs.
+
+## 2026-06-29 reverse remote-cache Timing run
+
+The user ran the reverse remote-cache variant and asked Codex to inspect
+`m5out-hsa-remote-cache-read-reverse`.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read-reverse/simout.txt`
+- `m5out-hsa-remote-cache-read-reverse/simerr.txt`
+- `m5out-hsa-remote-cache-read-reverse/remote-cache.trace`
+- `m5out-hsa-remote-cache-read-reverse/stats.txt`
+
+First relevant observable result:
+
+- The run completed normally:
+  `Exiting @ tick 23699498778 because exiting with last active thread context.`
+- Reverse mode produced:
+  `REMOTE_CACHE_READ_REVERSE_RESULT first=0x11112222 second=0x33334444 classification=1`.
+- The final result was:
+  `REMOTE_CACHE_READ_REVERSE_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- No `panic`, `fatal`, or `Invalid transition` string was found in
+  `simout.txt`, `simerr.txt`, or `remote-cache.trace`.
+- Reverse mode loaded `remote_cache_reader` for GPU0 and created the reader
+  queue on GPU0:
+  `hsa_queue_create GPU0`.
+- Initial value setup completed through `H2D_GPU0_INITIAL`.
+- Source setup completed through `H2D_GPU1_SOURCE`.
+- GPU0 reader observed `first_read_done=1` before the overwrite.
+- The GPU1-to-GPU0 overwrite completed through a GPU1 SDMA_XGMI queue:
+  - queue 4 was created on GPU ID `22125` with queue type 3 and backend
+    `sdma_xgmi`;
+  - the doorbell write used register offset `0x20`;
+  - the doorbell was routed to `SESDMAEngine`;
+  - the SDMA queue drained to write pointer 84.
+- GPU0 reader then observed `reader_done=1`, and the reader dispatch completed.
+- The final stats section records:
+  - `Directory_Controller.DmaWrite::total 2`;
+  - `Directory_Controller.U.DmaWrite::total 2`;
+  - `Directory_Controller.BDW_M.L3Hit::total 1`;
+  - `Directory_Controller.BDW_M.MemData::total 1`;
+  - `DMA_Controller.Ack::total 2`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the focused one-word SDMA_XGMI remote-write-after-cache-read path
+  is symmetric for GPU0-to-GPU1 and GPU1-to-GPU0 in this test harness.
+- Accepted: the existing `BDW_M + L3Hit` directory fix covers the reverse
+  direction as well as the default and repeated directions.
+- Rejected: the reverse variant exposes a new routing or Ruby protocol failure
+  in the tested path.
+- Not proven: complete multi-GPU coherence for shader stores, non-SDMA remote
+  writes, multiple cache-line offsets, vector-width accesses, or broader
+  GPU_VIPER cache-state combinations.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, SDMA trace, and Ruby stats.
+- Confirmed reverse-mode result classified as updated.
+- Confirmed normal simulator exit and no panic/fatal/invalid-transition text.
+
+Single next diagnostic step: add a same-cache-line multi-offset diagnostic
+variant so the next run checks whether remote writes to multiple dwords within
+one line produce coherent per-offset observations, instead of only validating
+the offset-0 one-word case.
+
+## 2026-06-29 same-line multi-offset remote-cache implementation
+
+The user accepted the next diagnostic step. Codex implemented a
+same-cache-line multi-offset variant in the existing `hsa_remote_cache_read`
+binary. No long gem5 simulation was started in this step.
+
+Chosen variant:
+
+- Preserve the default single-round GPU0-to-GPU1 mode.
+- Preserve `--mode repeated`.
+- Preserve `--mode reverse`.
+- Add `--mode multi-offset`.
+- Keep the source/target direction as GPU0-to-GPU1 for the first multi-offset
+  diagnostic.
+- Allocate enough GPU0/GPU1 memory for four dwords in one contiguous region.
+- Initialize the GPU1 target with `ValueA + offset` for offsets 0..3.
+- Initialize the GPU0 source with `ValueB + offset` for offsets 0..3.
+- Launch a single GPU1 reader dispatch that reads all four target dwords,
+  waits for the host-controlled release flag, then reads all four dwords again.
+- Perform one SDMA_XGMI overwrite from GPU0 source to GPU1 target covering all
+  four dwords.
+- Print one result line per dword plus an aggregate
+  `REMOTE_CACHE_READ_MULTI_OFFSET_RESULT`.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+First relevant result:
+
+- RED: the structural test failed as expected because
+  `REMOTE_CACHE_READ_MULTI_OFFSET_RESULT` was not present in
+  `hsa_remote_cache_read.cpp`.
+
+After implementation, Codex reran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+Result: the structural test passed.
+
+Codex rebuilt the smoke binary:
+
+```bash
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+```
+
+Result: `remote_cache_kernels.hsaco` and `hsa_remote_cache_read` rebuilt
+successfully.
+
+Codex then ran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+git diff --check
+```
+
+Result:
+
+- both pyunit tests passed;
+- `git diff --check` produced no whitespace errors.
+
+Facts confirmed:
+
+- `hsa_remote_cache_read` now accepts `--mode multi-offset`.
+- The kernel file now contains
+  `remote_cache_multi_offset_reader`.
+- The multi-offset reader keeps target data non-volatile and uses only the
+  control structure as volatile synchronization.
+- The host harness prints:
+  - `REMOTE_CACHE_READ_MULTI_OFFSET_ENTRY`;
+  - `REMOTE_CACHE_READ_MULTI_OFFSET_RESULT`;
+  - `REMOTE_CACHE_READ_MULTI_OFFSET_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_MULTI_OFFSET_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_MULTI_OFFSET_FAILED_UNEXPECTED`.
+- The overwrite label for the new diagnostic is
+  `GPU0_TO_GPU1_MULTI_OFFSET_OVERWRITE`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the next useful diagnostic should keep one variable changed:
+  same direction as the known passing GPU0-to-GPU1 case, but widen the
+  overwrite/read from one dword to four dwords in one contiguous line.
+- Accepted: no gem5 rebuild is required for this source-only smoke change; the
+  HSA test binary and HSACO rebuild are sufficient.
+- Not tested yet: whether the full Timing run observes updated values for all
+  four offsets or exposes partial stale behavior.
+
+Files changed:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hip`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Generated local artifacts:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.bundle`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hsaco`
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read`
+
+Verification completed:
+
+- TDD RED/GREEN structural pyunit.
+- Standalone ROCm 4.0.1 rebuild of `hsa_remote_cache_read`.
+- Related structural pyunit plus `git diff --check`.
+
+Single next diagnostic step: run the new multi-offset variant under Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-multi-offset -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode multi-offset' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspect whether all `REMOTE_CACHE_READ_MULTI_OFFSET_ENTRY` lines classify as
+updated, whether `REMOTE_CACHE_READ_MULTI_OFFSET_PASSED_UPDATED` appears, and
+whether any new Ruby protocol panic occurs.
+
+## 2026-06-29 same-line multi-offset remote-cache Timing run
+
+The user ran the multi-offset remote-cache variant and asked Codex to inspect
+`m5out-hsa-remote-cache-read-multi-offset`.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-multi-offset -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode multi-offset' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read-multi-offset/simout.txt`
+- `m5out-hsa-remote-cache-read-multi-offset/simerr.txt`
+- `m5out-hsa-remote-cache-read-multi-offset/remote-cache.trace`
+- `m5out-hsa-remote-cache-read-multi-offset/stats.txt`
+
+First relevant observable result:
+
+- The run completed normally:
+  `Exiting @ tick 24596355357 because exiting with last active thread context.`
+- All four same-line dword entries classified as updated:
+  - offset 0: `first=0x11112222 second=0x33334444 classification=1`;
+  - offset 1: `first=0x11112223 second=0x33334445 classification=1`;
+  - offset 2: `first=0x11112224 second=0x33334446 classification=1`;
+  - offset 3: `first=0x11112225 second=0x33334447 classification=1`.
+- Aggregate result:
+  `REMOTE_CACHE_READ_MULTI_OFFSET_RESULT count=4 classification=1`.
+- Final result:
+  `REMOTE_CACHE_READ_MULTI_OFFSET_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- No `panic`, `fatal`, or `Invalid transition` string was found in
+  `simout.txt`, `simerr.txt`, or `remote-cache.trace`.
+- The run loaded `remote_cache_multi_offset_reader` for GPU1 and created the
+  reader queue on GPU1.
+- Initial target setup used `H2D_GPU1_INITIAL` with 16 bytes.
+- Source setup used `H2D_GPU0_MULTI_OFFSET_SOURCE` with 16 bytes.
+- The reader observed `first_read_done=1` before the overwrite.
+- The overwrite used `GPU0_TO_GPU1_MULTI_OFFSET_OVERWRITE` with 16 bytes.
+- The overwrite completed through a GPU0 SDMA_XGMI queue:
+  - queue 4 was created on GPU ID `22124` with queue type 3 and backend
+    `sdma_xgmi`;
+  - the doorbell write used register offset `0x20`;
+  - the doorbell was routed to `SESDMAEngine`;
+  - the SDMA completion atomic decremented the completion signal from 1 to 0;
+  - the SDMA queue drained to read pointer 84.
+- The final stats section records:
+  - `Directory_Controller.DmaWrite::total 2`;
+  - `Directory_Controller.U.DmaWrite::total 2`;
+  - `Directory_Controller.BDW_M.L3Hit::total 1`;
+  - `Directory_Controller.BDW_M.MemData::total 1`;
+  - `DMA_Controller.Ack::total 2`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: in the focused GPU0-to-GPU1 SDMA_XGMI path, widening the overwrite
+  from one dword to four contiguous dwords in the same line still produces
+  updated observations for every tested offset.
+- Accepted: the existing `BDW_M + L3Hit` directory fix remains compatible with
+  the same-line multi-offset path.
+- Rejected: this same-line multi-offset diagnostic exposes partial stale data
+  or a new Ruby protocol invalid transition.
+- Not proven: multi-line writes, larger SDMA copies, reverse multi-offset,
+  shader-store remote writes, or full multi-GPU GPU_VIPER coherence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, SDMA trace, and Ruby stats.
+- Confirmed all four offsets classified as updated.
+- Confirmed normal simulator exit and no panic/fatal/invalid-transition text.
+
+Single next diagnostic step: add a multi-line variant that writes at least two
+cache lines, then run it under Timing CPU to check whether the current behavior
+still holds when the remote write spans more than one cache line.
+
+## 2026-06-29 multi-line remote-cache implementation
+
+The user accepted the next diagnostic step. Codex implemented a multi-line
+variant in the existing `hsa_remote_cache_read` binary. No long gem5
+simulation was started in this step.
+
+Chosen variant:
+
+- Preserve the default single-round GPU0-to-GPU1 mode.
+- Preserve `--mode repeated`.
+- Preserve `--mode reverse`.
+- Preserve `--mode multi-offset`.
+- Add `--mode multi-line`.
+- Keep the direction as GPU0-to-GPU1 for the first multi-line diagnostic.
+- Increase the vector reader control arrays from 8 entries to 32 entries.
+- Use 32 dwords, or 128 bytes, so the tested overwrite spans at least two
+  64-byte cache lines.
+- Reuse the existing `remote_cache_multi_offset_reader` kernel by passing a
+  larger dword count.
+- Initialize the GPU1 target with `ValueA + offset` for offsets 0..31.
+- Initialize the GPU0 source with `ValueB + offset` for offsets 0..31.
+- Perform one SDMA_XGMI overwrite from GPU0 source to GPU1 target covering all
+  128 bytes.
+- Print one result line per dword plus aggregate
+  `REMOTE_CACHE_READ_MULTI_LINE_RESULT`.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+First relevant result:
+
+- RED: the structural test failed as expected because
+  `REMOTE_CACHE_READ_MULTI_LINE_RESULT` was not present in
+  `hsa_remote_cache_read.cpp`.
+
+After implementation, Codex reran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+Result: the structural test passed.
+
+Codex rebuilt the smoke binary:
+
+```bash
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+```
+
+Result: `remote_cache_kernels.hsaco` and `hsa_remote_cache_read` rebuilt
+successfully.
+
+Codex then ran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+git diff --check
+```
+
+Result:
+
+- both pyunit tests passed;
+- `git diff --check` produced no whitespace errors.
+
+Facts confirmed:
+
+- `hsa_remote_cache_read` now accepts `--mode multi-line`.
+- `MultiLineDwords` is 32 and `MultiLineBytes` is 128.
+- The vector reader control arrays now hold 32 first/second/classification
+  entries.
+- The kernel clamps vector count to 32.
+- The host harness prints:
+  - `REMOTE_CACHE_READ_MULTI_LINE_ENTRY`;
+  - `REMOTE_CACHE_READ_MULTI_LINE_RESULT`;
+  - `REMOTE_CACHE_READ_MULTI_LINE_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_MULTI_LINE_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_MULTI_LINE_FAILED_UNEXPECTED`.
+- The overwrite label for the new diagnostic is
+  `GPU0_TO_GPU1_MULTI_LINE_OVERWRITE`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the next useful diagnostic should keep the known passing
+  GPU0-to-GPU1 direction but expand the SDMA_XGMI write from one cache line to
+  at least two cache lines.
+- Accepted: the existing vector reader kernel can cover both same-line and
+  multi-line diagnostics by changing the dword count.
+- Accepted: no gem5 rebuild is required for this source-only smoke change; the
+  HSA test binary and HSACO rebuild are sufficient.
+- Not tested yet: whether the full Timing run observes updated values for all
+  32 offsets or exposes per-line stale behavior.
+
+Files changed:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hip`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Generated local artifacts:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.bundle`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hsaco`
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read`
+
+Verification completed:
+
+- TDD RED/GREEN structural pyunit.
+- Standalone ROCm 4.0.1 rebuild of `hsa_remote_cache_read`.
+- Related structural pyunit plus `git diff --check`.
+
+Single next diagnostic step: run the new multi-line variant under Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-multi-line -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode multi-line' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspect whether all `REMOTE_CACHE_READ_MULTI_LINE_ENTRY` lines classify as
+updated, whether `REMOTE_CACHE_READ_MULTI_LINE_PASSED_UPDATED` appears, and
+whether any new Ruby protocol panic occurs.
+
+## 2026-06-29 multi-line remote-cache Timing run
+
+The user ran the multi-line remote-cache variant and asked Codex to inspect
+`m5out-hsa-remote-cache-read-multi-line`.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-multi-line -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode multi-line' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read-multi-line/simout.txt`
+- `m5out-hsa-remote-cache-read-multi-line/simerr.txt`
+- `m5out-hsa-remote-cache-read-multi-line/remote-cache.trace`
+- `m5out-hsa-remote-cache-read-multi-line/stats.txt`
+
+First relevant observable result:
+
+- The run completed normally:
+  `Exiting @ tick 24675475491 because exiting with last active thread context.`
+- All 32 multi-line dword entries classified as updated.
+- Aggregate result:
+  `REMOTE_CACHE_READ_MULTI_LINE_RESULT count=32 classification=1`.
+- Final result:
+  `REMOTE_CACHE_READ_MULTI_LINE_PASSED_UPDATED`.
+
+Representative per-offset results:
+
+- offset 0: `first=0x11112222 second=0x33334444 classification=1`;
+- offset 15: `first=0x11112231 second=0x33334453 classification=1`;
+- offset 16: `first=0x11112232 second=0x33334454 classification=1`;
+- offset 31: `first=0x11112241 second=0x33334463 classification=1`.
+
+Facts confirmed:
+
+- No `panic`, `fatal`, or `Invalid transition` string was found in
+  `simout.txt`, `simerr.txt`, or `remote-cache.trace`.
+- The run loaded `remote_cache_multi_offset_reader` for GPU1 and created the
+  reader queue on GPU1.
+- Initial target setup used `H2D_GPU1_INITIAL` with 128 bytes.
+- Source setup used `H2D_GPU0_MULTI_LINE_SOURCE` with 128 bytes.
+- The reader observed `first_read_done=1` before the overwrite.
+- The overwrite used `GPU0_TO_GPU1_MULTI_LINE_OVERWRITE` with 128 bytes.
+- The overwrite completed through a GPU0 SDMA_XGMI queue:
+  - queue 4 was created on GPU ID `22124` with queue type 3 and backend
+    `sdma_xgmi`;
+  - the doorbell write used register offset `0x20`;
+  - the doorbell was routed to `SESDMAEngine`;
+  - the SDMA queue drained to read pointer 84.
+- The final stats section records:
+  - `Directory_Controller.DmaWrite::total 2`;
+  - `Directory_Controller.U.DmaWrite::total 2`;
+  - `Directory_Controller.BDW_M.L3Hit::total 1`;
+  - `Directory_Controller.BDW_M.MemData::total 1`;
+  - `DMA_Controller.Ack::total 2`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: in the focused GPU0-to-GPU1 SDMA_XGMI path, widening the overwrite
+  to 128 bytes spanning at least two cache lines still produces updated
+  observations for every tested offset.
+- Accepted: the existing `BDW_M + L3Hit` directory fix remains compatible with
+  this multi-line SDMA_XGMI path.
+- Rejected: this multi-line diagnostic exposes per-line stale data or a new
+  Ruby protocol invalid transition.
+- Not proven: larger multi-line writes, reverse multi-line writes, shader-store
+  remote writes, CPU-visible coherence, or full multi-GPU GPU_VIPER coherence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, SDMA trace, and Ruby stats.
+- Confirmed all 32 offsets classified as updated.
+- Confirmed normal simulator exit and no panic/fatal/invalid-transition text.
+
+Single next diagnostic step: add a reverse multi-line variant, swapping the
+reader/target to GPU0 and the source writer to GPU1, then run it under Timing
+CPU to determine whether the multi-line behavior remains symmetric.
+
+## 2026-06-29 reverse multi-line remote-cache implementation
+
+The user accepted the next diagnostic step. Codex implemented a reverse
+multi-line variant in the existing `hsa_remote_cache_read` binary. No long
+gem5 simulation was started in this step.
+
+Chosen variant:
+
+- Preserve all existing modes:
+  - default single-round GPU0-to-GPU1;
+  - `--mode repeated`;
+  - `--mode reverse`;
+  - `--mode multi-offset`;
+  - `--mode multi-line`.
+- Add `--mode reverse-multi-line`.
+- Swap the 128-byte multi-line direction:
+  - GPU0 becomes reader and target;
+  - GPU1 becomes source/writer;
+  - the overwrite label is `GPU1_TO_GPU0_MULTI_LINE_OVERWRITE`;
+  - the result marker is `REMOTE_CACHE_READ_REVERSE_MULTI_LINE_RESULT`.
+- Reuse the existing vector reader kernel and vector host helper.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+First relevant result:
+
+- RED: the structural test failed as expected because
+  `REMOTE_CACHE_READ_REVERSE_MULTI_LINE_RESULT` was not present in
+  `hsa_remote_cache_read.cpp`.
+
+After implementation, Codex reran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+Result: the structural test passed.
+
+Codex rebuilt the smoke binary:
+
+```bash
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+```
+
+Result: `hsa_remote_cache_read` rebuilt successfully. The HSACO did not need
+to be regenerated because only the host harness changed.
+
+Codex then ran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+git diff --check
+```
+
+Result:
+
+- both pyunit tests passed;
+- `git diff --check` produced no whitespace errors.
+
+Facts confirmed:
+
+- `hsa_remote_cache_read` now accepts `--mode reverse-multi-line`.
+- Reverse multi-line uses the same 32-dword, 128-byte vector size as
+  `--mode multi-line`.
+- The host harness selects reverse roles for both `--mode reverse` and
+  `--mode reverse-multi-line`:
+  - `reader_agent = gpu0`;
+  - `source_agent = gpu1`;
+  - `target_agent = gpu0`;
+  - `source = gpu1_target`;
+  - `target = gpu0_source`.
+- The host harness prints:
+  - `REMOTE_CACHE_READ_REVERSE_MULTI_LINE_ENTRY`;
+  - `REMOTE_CACHE_READ_REVERSE_MULTI_LINE_RESULT`;
+  - `REMOTE_CACHE_READ_REVERSE_MULTI_LINE_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_REVERSE_MULTI_LINE_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_REVERSE_MULTI_LINE_FAILED_UNEXPECTED`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: reverse multi-line can be added with a host-harness role swap and
+  does not require a new GPU kernel.
+- Accepted: no gem5 rebuild is required for this source-only smoke change; the
+  HSA test binary rebuild is sufficient.
+- Not tested yet: whether the full Timing run observes updated values for all
+  32 reverse-direction offsets or exposes asymmetric per-line stale behavior.
+
+Files changed:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Generated local artifact:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read`
+
+Verification completed:
+
+- TDD RED/GREEN structural pyunit.
+- Standalone ROCm 4.0.1 rebuild of `hsa_remote_cache_read`.
+- Related structural pyunit plus `git diff --check`.
+
+Single next diagnostic step: run the new reverse multi-line variant under
+Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-multi-line -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-multi-line' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspect whether all `REMOTE_CACHE_READ_REVERSE_MULTI_LINE_ENTRY` lines classify
+as updated, whether `REMOTE_CACHE_READ_REVERSE_MULTI_LINE_PASSED_UPDATED`
+appears, and whether any new Ruby protocol panic occurs.
+
+## 2026-06-29 reverse multi-line remote-cache Timing run
+
+The user ran the reverse multi-line remote-cache variant and asked Codex to
+inspect `m5out-hsa-remote-cache-read-reverse-multi-line`.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-multi-line -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-multi-line' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read-reverse-multi-line/simout.txt`
+- `m5out-hsa-remote-cache-read-reverse-multi-line/simerr.txt`
+- `m5out-hsa-remote-cache-read-reverse-multi-line/remote-cache.trace`
+- `m5out-hsa-remote-cache-read-reverse-multi-line/stats.txt`
+
+First relevant observable result:
+
+- The run completed normally:
+  `Exiting @ tick 24694793154 because exiting with last active thread context.`
+- All 32 reverse multi-line dword entries classified as updated.
+- Aggregate result:
+  `REMOTE_CACHE_READ_REVERSE_MULTI_LINE_RESULT count=32 classification=1`.
+- Final result:
+  `REMOTE_CACHE_READ_REVERSE_MULTI_LINE_PASSED_UPDATED`.
+
+Representative per-offset results:
+
+- offset 0: `first=0x11112222 second=0x33334444 classification=1`;
+- offset 15: `first=0x11112231 second=0x33334453 classification=1`;
+- offset 16: `first=0x11112232 second=0x33334454 classification=1`;
+- offset 31: `first=0x11112241 second=0x33334463 classification=1`.
+
+Facts confirmed:
+
+- No `panic`, `fatal`, or `Invalid transition` string was found in
+  `simout.txt`, `simerr.txt`, or `remote-cache.trace`.
+- The run loaded `remote_cache_multi_offset_reader` for GPU0 and created the
+  reader queue on GPU0.
+- Initial target setup used `H2D_GPU0_INITIAL` with 128 bytes.
+- Source setup used `H2D_GPU1_MULTI_LINE_SOURCE` with 128 bytes.
+- The reader observed `first_read_done=1` before the overwrite.
+- The overwrite used `GPU1_TO_GPU0_MULTI_LINE_OVERWRITE` with 128 bytes.
+- The overwrite completed through a GPU1 SDMA_XGMI queue:
+  - queue 4 was created on GPU ID `22125` with queue type 3 and backend
+    `sdma_xgmi`;
+  - the doorbell write used register offset `0x20`;
+  - the doorbell was routed to `SESDMAEngine`;
+  - the SDMA queue drained to read pointer 84.
+- The final stats section records:
+  - `Directory_Controller.DmaWrite::total 2`;
+  - `Directory_Controller.U.DmaWrite::total 2`;
+  - `Directory_Controller.BDW_M.L3Hit::total 1`;
+  - `Directory_Controller.BDW_M.MemData::total 1`;
+  - `DMA_Controller.Ack::total 2`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: in the focused GPU1-to-GPU0 SDMA_XGMI path, widening the overwrite
+  to 128 bytes spanning at least two cache lines still produces updated
+  observations for every tested offset.
+- Accepted: the focused SDMA_XGMI remote-write-after-cache-read behavior is
+  symmetric for 128-byte multi-line GPU0-to-GPU1 and GPU1-to-GPU0 variants.
+- Accepted: the existing `BDW_M + L3Hit` directory fix remains compatible with
+  both multi-line directions.
+- Rejected: this reverse multi-line diagnostic exposes per-line stale data or
+  a new Ruby protocol invalid transition.
+- Not proven: larger copies, concurrent bidirectional traffic, shader-store
+  remote writes, CPU-visible coherence, or full multi-GPU GPU_VIPER coherence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, SDMA trace, and Ruby stats.
+- Confirmed all 32 reverse-direction offsets classified as updated.
+- Confirmed normal simulator exit and no panic/fatal/invalid-transition text.
+
+Single next diagnostic step: run a larger-copy vector diagnostic, such as
+4 KiB GPU0-to-GPU1 and then reverse, to determine whether this behavior holds
+across many cache lines instead of only two cache lines.
+
+## 2026-06-29 large-copy remote-cache implementation
+
+The user accepted the next diagnostic step. Codex implemented 4 KiB vector
+diagnostics in the existing `hsa_remote_cache_read` binary. No long gem5
+simulation was started in this step.
+
+Chosen variants:
+
+- Preserve all existing modes:
+  - default single-round GPU0-to-GPU1;
+  - `--mode repeated`;
+  - `--mode reverse`;
+  - `--mode multi-offset`;
+  - `--mode multi-line`;
+  - `--mode reverse-multi-line`.
+- Add `--mode large-copy` for GPU0-to-GPU1.
+- Add `--mode reverse-large-copy` for GPU1-to-GPU0.
+- Use 1024 dwords, or 4096 bytes, so the tested overwrite spans many cache
+  lines.
+- Increase the vector reader control arrays from 32 entries to 1024 entries.
+- Clamp the vector reader kernel count to 1024.
+- Reuse the existing vector reader kernel and vector host helper.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+First relevant result:
+
+- RED: the structural test failed as expected because
+  `REMOTE_CACHE_READ_LARGE_COPY_RESULT` was not present in
+  `hsa_remote_cache_read.cpp`.
+
+After implementation, Codex reran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+Result: the structural test passed.
+
+Codex rebuilt the smoke binary and HSACO:
+
+```bash
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+```
+
+Result: `remote_cache_kernels.hsaco` and `hsa_remote_cache_read` rebuilt
+successfully.
+
+Codex then ran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+git diff --check
+```
+
+Result:
+
+- both pyunit tests passed;
+- `git diff --check` produced no whitespace errors.
+
+Facts confirmed:
+
+- `hsa_remote_cache_read` now accepts:
+  - `--mode large-copy`;
+  - `--mode reverse-large-copy`.
+- `LargeCopyDwords` is 1024 and `LargeCopyBytes` is 4096.
+- The vector reader control arrays now hold 1024 first/second/classification
+  entries.
+- The kernel clamps vector count to 1024.
+- The host harness prints:
+  - `REMOTE_CACHE_READ_LARGE_COPY_ENTRY`;
+  - `REMOTE_CACHE_READ_LARGE_COPY_RESULT`;
+  - `REMOTE_CACHE_READ_LARGE_COPY_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_LARGE_COPY_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_LARGE_COPY_FAILED_UNEXPECTED`;
+  - `REMOTE_CACHE_READ_REVERSE_LARGE_COPY_ENTRY`;
+  - `REMOTE_CACHE_READ_REVERSE_LARGE_COPY_RESULT`;
+  - `REMOTE_CACHE_READ_REVERSE_LARGE_COPY_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_REVERSE_LARGE_COPY_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_REVERSE_LARGE_COPY_FAILED_UNEXPECTED`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the large-copy diagnostic can reuse the existing vector reader
+  kernel by increasing the dword count and control array size.
+- Accepted: the next full simulation should first run `--mode large-copy`, then
+  `--mode reverse-large-copy`, so direction and copy size are varied in a
+  controlled way.
+- Accepted: no gem5 rebuild is required for this source-only smoke change; the
+  HSA test binary and HSACO rebuild are sufficient.
+- Not tested yet: whether the full Timing runs observe updated values for all
+  1024 offsets in either direction.
+
+Files changed:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hip`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Generated local artifacts:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.bundle`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hsaco`
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read`
+
+Verification completed:
+
+- TDD RED/GREEN structural pyunit.
+- Standalone ROCm 4.0.1 rebuild of `hsa_remote_cache_read`.
+- Related structural pyunit plus `git diff --check`.
+
+Single next diagnostic step: run the new large-copy variant under Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-large-copy -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode large-copy' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+If that completes, run the reverse variant:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-large-copy -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-large-copy' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspect whether all 1024 entries classify as updated, whether the final
+`*_PASSED_UPDATED` marker appears, and whether any Ruby protocol panic occurs.
+
+## 2026-06-29 large-copy remote-cache Timing runs
+
+The user ran both 4 KiB remote-cache variants and asked Codex to inspect the
+corresponding output directories. Codex only performed read-only log
+inspection; no new gem5 simulation was started.
+
+Commands recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-large-copy -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode large-copy' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-large-copy -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-large-copy' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspection commands run by Codex:
+
+```bash
+rg -n "REMOTE_CACHE_READ_(LARGE_COPY|REVERSE_LARGE_COPY)_(RESULT|PASSED_UPDATED|OBSERVED_STALE|FAILED_UNEXPECTED)|Exiting @ tick" m5out-hsa-remote-cache-read-large-copy/simout.txt m5out-hsa-remote-cache-read-reverse-large-copy/simout.txt
+rg -c "REMOTE_CACHE_READ_LARGE_COPY_ENTRY .*classification=1" m5out-hsa-remote-cache-read-large-copy/simout.txt
+rg -c "REMOTE_CACHE_READ_REVERSE_LARGE_COPY_ENTRY .*classification=1" m5out-hsa-remote-cache-read-reverse-large-copy/simout.txt
+rg -n "classification=[23]|OBSERVED_STALE|FAILED_UNEXPECTED|panic|fatal|Invalid transition" m5out-hsa-remote-cache-read-large-copy/simout.txt m5out-hsa-remote-cache-read-large-copy/simerr.txt m5out-hsa-remote-cache-read-large-copy/remote-cache.trace m5out-hsa-remote-cache-read-reverse-large-copy/simout.txt m5out-hsa-remote-cache-read-reverse-large-copy/simerr.txt m5out-hsa-remote-cache-read-reverse-large-copy/remote-cache.trace
+rg -n "AMDKFD_IOC_CREATE_QUEUE assigned queue_id 4|doorbell route daddr 0x20|SDMA queue 4 drained|remote_cache_multi_offset_reader" m5out-hsa-remote-cache-read-large-copy/remote-cache.trace m5out-hsa-remote-cache-read-reverse-large-copy/remote-cache.trace
+rg -n "Directory_Controller\.(DmaWrite|U\.DmaWrite|BDW_M\.(L3Hit|MemData))::total|DMA_Controller\.Ack::total" m5out-hsa-remote-cache-read-large-copy/stats.txt m5out-hsa-remote-cache-read-reverse-large-copy/stats.txt
+```
+
+First relevant observable results:
+
+- Forward 4 KiB run:
+  - `REMOTE_CACHE_READ_LARGE_COPY_RESULT count=1024 classification=1`;
+  - `REMOTE_CACHE_READ_LARGE_COPY_PASSED_UPDATED`;
+  - `Exiting @ tick 28239863202 because exiting with last active thread context.`
+- Reverse 4 KiB run:
+  - `REMOTE_CACHE_READ_REVERSE_LARGE_COPY_RESULT count=1024 classification=1`;
+  - `REMOTE_CACHE_READ_REVERSE_LARGE_COPY_PASSED_UPDATED`;
+  - `Exiting @ tick 28273477554 because exiting with last active thread context.`
+
+Facts confirmed:
+
+- Both runs completed normally.
+- Both runs reported 1024 per-entry `classification=1` lines.
+- No `classification=2`, `classification=3`, `OBSERVED_STALE`,
+  `FAILED_UNEXPECTED`, `panic`, `fatal`, or `Invalid transition` string was
+  found in the inspected stdout, stderr, or trace files.
+- Forward direction:
+  - the reader observed `first_read_done=1`;
+  - overwrite label was `GPU0_TO_GPU1_LARGE_COPY_OVERWRITE`;
+  - SDMA_XGMI queue 4 was created on GPU ID `22124`;
+  - doorbell offset `0x20` was routed to `SESDMAEngine`;
+  - `SDMA queue 4 drained at rptr 84`.
+- Reverse direction:
+  - the reader observed `first_read_done=1`;
+  - overwrite label was `GPU1_TO_GPU0_LARGE_COPY_OVERWRITE`;
+  - SDMA_XGMI queue 4 was created on GPU ID `22125`;
+  - doorbell offset `0x20` was routed to `SESDMAEngine`;
+  - `SDMA queue 4 drained at rptr 84`.
+- In both stats files, earlier sections show the 4 KiB copy expanding to many
+  DMA events:
+  - `Directory_Controller.DmaWrite::total 69`;
+  - later `Directory_Controller.DmaWrite::total 138`.
+- In the final stats section of both runs:
+  - `Directory_Controller.DmaWrite::total 2`;
+  - `Directory_Controller.U.DmaWrite::total 2`;
+  - `Directory_Controller.BDW_M.L3Hit::total 1`;
+  - `Directory_Controller.BDW_M.MemData::total 1`;
+  - `DMA_Controller.Ack::total 2`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: for the focused SDMA_XGMI overwrite path, 4 KiB
+  remote-write-after-cache-read observes updated values for all 1024 dwords in
+  both GPU0-to-GPU1 and GPU1-to-GPU0 directions.
+- Accepted: the `BDW_M + L3Hit` directory transition fix remains compatible
+  with larger SDMA_XGMI copy runs in both directions.
+- Rejected: the 4 KiB vector diagnostic exposes stale values, unexpected
+  values, or a new Ruby invalid transition in this focused SDMA path.
+- Not proven: shader-store remote writes, concurrent bidirectional traffic,
+  CPU-visible coherence, arbitrary ROCm API behavior, or complete multi-GPU
+  GPU_VIPER coherence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, SDMA trace, and Ruby stats for both
+  4 KiB directions.
+- Confirmed all 1024 entries classify as updated in each direction.
+- Confirmed normal simulator exit and no panic/fatal/invalid-transition text.
+
+Single next diagnostic step: move from SDMA_XGMI overwrite diagnostics to a
+shader-store remote-write-after-cache-read diagnostic, where one GPU kernel
+writes remote VRAM while the peer GPU has already cached the target line. This
+will test the non-SDMA GPU write path, which is still not proven by the
+current SDMA-based runs.
+
+## 2026-06-29 shader-store remote-cache smoke implementation
+
+The user accepted the next diagnostic step. Codex implemented a non-SDMA
+shader-store remote-write-after-cache-read variant in the existing
+`hsa_remote_cache_read` smoke. No full gem5 simulation was started in this
+step.
+
+Design implemented:
+
+- Preserve all existing SDMA overwrite modes.
+- Add `--mode shader-store` for GPU0 kernel store to GPU1 target memory.
+- Add `--mode reverse-shader-store` for GPU1 kernel store to GPU0 target
+  memory.
+- Keep the reader as a long-running kernel on the target GPU:
+  1. reader reads `target[0]`;
+  2. reader publishes `first_read_done`;
+  3. host dispatches writer kernel on the peer GPU;
+  4. writer kernel executes a normal `*target = value` store;
+  5. host waits for writer completion;
+  6. host releases reader for the second read;
+  7. reader classifies updated, stale, or unexpected.
+- Load the HSACO for both reader and writer agents when the writer is on the
+  peer GPU.
+- Create a separate compute queue for the writer GPU in shader-store modes.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+First relevant result:
+
+- RED: the structural test failed because
+  `REMOTE_CACHE_READ_SHADER_STORE_RESULT` was not present in
+  `hsa_remote_cache_read.cpp`.
+
+After implementation, Codex reran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+Result: the structural test passed.
+
+Codex rebuilt the smoke binary and HSACO:
+
+```bash
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+```
+
+Result: `remote_cache_kernels.hsaco` and `hsa_remote_cache_read` rebuilt
+successfully.
+
+Codex then ran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+git diff --check
+```
+
+Result:
+
+- both pyunit tests passed;
+- `git diff --check` produced no whitespace errors.
+
+Facts confirmed:
+
+- `remote_cache_kernels.hip` now defines `remote_cache_writer`.
+- `remote_cache_writer` performs a normal shader store:
+  `*target = value`, followed by `__threadfence_system()`.
+- `hsa_remote_cache_read` now accepts:
+  - `--mode shader-store`;
+  - `--mode reverse-shader-store`.
+- The host harness now prints:
+  - `REMOTE_CACHE_READ_SHADER_STORE_RESULT`;
+  - `REMOTE_CACHE_READ_SHADER_STORE_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_SHADER_STORE_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_SHADER_STORE_FAILED_UNEXPECTED`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_STORE_RESULT`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_STORE_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_STORE_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_STORE_FAILED_UNEXPECTED`.
+- The initial value is still staged with HSA async-copy so the diagnostic
+  isolates the remote write mechanism, not target setup.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the non-SDMA remote-write-after-cache-read diagnostic can be added
+  as a source-only smoke extension; no gem5 rebuild is required for this step.
+- Accepted: this new mode targets the GPU shader store path, which was not
+  proven by prior SDMA_XGMI copy diagnostics.
+- Not tested yet: whether the full Timing simulation observes updated, stale,
+  unexpected, or a new protocol failure for either shader-store direction.
+
+Files changed:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hip`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Generated local artifacts:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.bundle`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hsaco`
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read`
+
+Verification completed:
+
+- TDD RED/GREEN structural pyunit.
+- Standalone ROCm 4.0.1 rebuild of `hsa_remote_cache_read`.
+- Related structural pyunit plus `git diff --check`.
+
+Single next diagnostic step: run the forward shader-store variant under Timing
+CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-shader-store -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode shader-store' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+If that completes, run the reverse variant:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-shader-store -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-shader-store' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspect whether the writer dispatch completes, whether the reader reaches
+`REMOTE_CACHE_READ_*_SHADER_STORE_RESULT`, and whether the result is updated,
+stale, unexpected, or a new GPU_VIPER protocol failure.
+
+## 2026-06-29 forward shader-store remote-cache Timing run
+
+The user ran the forward shader-store variant and asked Codex to inspect
+`m5out-hsa-remote-cache-read-shader-store`. Codex only performed read-only log
+inspection; no new gem5 simulation was started.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-shader-store -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode shader-store' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspection commands run by Codex:
+
+```bash
+rg -n "command line:|hsa_remote_cache_read|REMOTE_CACHE_READ_.*SHADER_STORE|Exiting @ tick" m5out-hsa-remote-cache-read-shader-store/simout.txt
+rg -n "panic|fatal|Invalid transition|FAILED_UNEXPECTED|OBSERVED_STALE|classification=[23]" m5out-hsa-remote-cache-read-shader-store/simout.txt m5out-hsa-remote-cache-read-shader-store/simerr.txt m5out-hsa-remote-cache-read-shader-store/remote-cache.trace
+rg -n "AMDKFD_IOC_CREATE_QUEUE request|AMDKFD_IOC_CREATE_QUEUE assigned|doorbell route daddr|HWScheduler|SESDMAEngine|Register SDMA queue|SDMA queue|remote_cache_reader|remote_cache_writer" m5out-hsa-remote-cache-read-shader-store/remote-cache.trace
+```
+
+First relevant observable result:
+
+- The run completed normally:
+  `Exiting @ tick 25981950375 because exiting with last active thread context.`
+- The reader reached the final classification:
+  `REMOTE_CACHE_READ_SHADER_STORE_RESULT first=0x11112222 second=0x33334444 classification=1`.
+- Final result:
+  `REMOTE_CACHE_READ_SHADER_STORE_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- The run loaded the HSACO for both agents:
+  - reader symbol `remote_cache_reader`, object `0x7ffdf6603000`;
+  - writer symbol `remote_cache_writer`, object `0x7ffdf6a03700`.
+- The reader queue was created on GPU1:
+  - queue id 3;
+  - GPU ID `22125`;
+  - queue type 2;
+  - backend `compute`;
+  - doorbell offset `0x18`;
+  - routed to `HWScheduler`.
+- The writer queue was created on GPU0:
+  - queue id 4;
+  - GPU ID `22124`;
+  - queue type 2;
+  - backend `compute`;
+  - doorbell offset `0x20`;
+  - routed to `HWScheduler`.
+- The writer path did not use SDMA:
+  - writer doorbell had `sdma_hit 0`;
+  - writer queue 4 routed to `HWScheduler`, not `SESDMAEngine`.
+- The initial target setup still used an ordinary H2D async-copy to GPU1 and
+  completed successfully before the shader-store diagnostic phase.
+- The reader observed `first_read_done=1`, then the host dispatched
+  `GPU0_TO_GPU1_SHADER_STORE`.
+- The writer dispatch completed successfully.
+- The reader then observed `reader_done=1` and completed successfully.
+- No `panic`, `fatal`, `Invalid transition`, `FAILED_UNEXPECTED`,
+  `OBSERVED_STALE`, or `classification=[23]` string was found in the inspected
+  stdout, stderr, or trace files.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the focused GPU0-to-GPU1 shader-store
+  remote-write-after-cache-read path can complete under Timing CPU and observe
+  the updated value.
+- Accepted: this result exercises a non-SDMA GPU compute writer path; the
+  writer dispatch is a compute queue routed to `HWScheduler`.
+- Rejected: the forward shader-store run exposes stale data or a new Ruby
+  protocol invalid transition.
+- Not proven: reverse shader-store direction, larger shader-store vectors,
+  concurrent bidirectional shader writes, CPU-visible coherence, or complete
+  multi-GPU GPU_VIPER coherence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, and trace.
+- Confirmed normal simulator exit, final updated classification, and compute
+  writer queue routing through `HWScheduler`.
+
+Single next diagnostic step: run the reverse shader-store variant under Timing
+CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-shader-store -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-shader-store' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspect whether GPU1-to-GPU0 shader-store also routes through a compute
+writer queue and whether GPU0 observes updated, stale, unexpected, or a new
+protocol failure.
+
+## 2026-06-29 reverse shader-store remote-cache Timing run
+
+The user ran the reverse shader-store variant and asked Codex to inspect
+`m5out-hsa-remote-cache-read-reverse-shader-store`. Codex only performed
+read-only log inspection; no new gem5 simulation was started.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-shader-store -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-shader-store' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspection commands run by Codex:
+
+```bash
+rg -n "command line:|hsa_remote_cache_read|REMOTE_CACHE_READ_.*SHADER_STORE|Exiting @ tick" m5out-hsa-remote-cache-read-reverse-shader-store/simout.txt
+rg -n "panic|fatal|Invalid transition|FAILED_UNEXPECTED|OBSERVED_STALE|classification=[23]" m5out-hsa-remote-cache-read-reverse-shader-store/simout.txt m5out-hsa-remote-cache-read-reverse-shader-store/simerr.txt m5out-hsa-remote-cache-read-reverse-shader-store/remote-cache.trace
+rg -n "AMDKFD_IOC_CREATE_QUEUE request|AMDKFD_IOC_CREATE_QUEUE assigned|doorbell route daddr|HWScheduler|SESDMAEngine|Register SDMA queue|SDMA queue|remote_cache_reader|remote_cache_writer" m5out-hsa-remote-cache-read-reverse-shader-store/remote-cache.trace
+rg -n "Directory_Controller\.(Load|Store|DmaWrite|U\.DmaWrite|BDW_M\.(L3Hit|MemData))::total|DMA_Controller\.Ack::total|TCP_Controller\.(Load|StoreThrough|Evict)::total|TCC_Controller\.(RdBlk|WrVicBlkBack|Data|WBAck)::total" m5out-hsa-remote-cache-read-reverse-shader-store/stats.txt
+```
+
+First relevant observable result:
+
+- The run completed normally:
+  `Exiting @ tick 25971486183 because exiting with last active thread context.`
+- The reader reached the final classification:
+  `REMOTE_CACHE_READ_REVERSE_SHADER_STORE_RESULT first=0x11112222 second=0x33334444 classification=1`.
+- Final result:
+  `REMOTE_CACHE_READ_REVERSE_SHADER_STORE_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- The run loaded the HSACO for both agents:
+  - reader symbol `remote_cache_reader`, object `0x7ffdf6a03000`;
+  - writer symbol `remote_cache_writer`, object `0x7ffdf6603700`.
+- The reader queue was created on GPU0:
+  - queue id 3;
+  - GPU ID `22124`;
+  - queue type 2;
+  - backend `compute`;
+  - doorbell offset `0x18`;
+  - routed to `HWScheduler`.
+- The writer queue was created on GPU1:
+  - queue id 4;
+  - GPU ID `22125`;
+  - queue type 2;
+  - backend `compute`;
+  - doorbell offset `0x20`;
+  - routed to `HWScheduler`.
+- The writer path did not use SDMA:
+  - writer doorbell had `sdma_hit 0`;
+  - writer queue 4 routed to `HWScheduler`, not `SESDMAEngine`.
+- The initial target setup used ordinary H2D async-copy to GPU0 and completed
+  successfully before the shader-store diagnostic phase.
+- The reader observed `first_read_done=1`, then the host dispatched
+  `GPU1_TO_GPU0_SHADER_STORE`.
+- The writer dispatch completed successfully.
+- The reader then observed `reader_done=1` and completed successfully.
+- No `panic`, `fatal`, `Invalid transition`, `FAILED_UNEXPECTED`,
+  `OBSERVED_STALE`, or `classification=[23]` string was found in the inspected
+  stdout, stderr, or trace files.
+- The stats show non-SDMA GPU traffic during the final sections, including
+  TCP `Load`, TCP `StoreThrough`, TCP `Evict`, TCC `RdBlk`, TCC
+  `WrVicBlkBack`, TCC `Data`, and TCC `WBAck` activity. DMA counts remain tied
+  to setup traffic rather than the shader-store writer dispatch.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the focused GPU1-to-GPU0 shader-store
+  remote-write-after-cache-read path can complete under Timing CPU and observe
+  the updated value.
+- Accepted: the shader-store diagnostic is symmetric for the single-dword
+  forward and reverse directions in this focused setup.
+- Accepted: both shader-store directions exercise non-SDMA GPU compute writer
+  queues routed to `HWScheduler`.
+- Rejected: the reverse shader-store run exposes stale data or a new Ruby
+  protocol invalid transition.
+- Not proven: larger shader-store vectors, repeated shader-store rounds,
+  concurrent bidirectional shader writes, CPU-visible coherence, arbitrary
+  ROCm API behavior, or complete multi-GPU GPU_VIPER coherence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and stats.
+- Confirmed normal simulator exit, final updated classification, and compute
+  writer queue routing through `HWScheduler`.
+
+Single next diagnostic step: add a multi-line shader-store vector variant,
+starting with 32 dwords in forward direction and then reverse if forward
+passes. This will test whether the non-SDMA shader-store behavior holds beyond
+one word and across multiple cache lines.
+
+## 2026-06-29 shader multi-line remote-cache smoke implementation
+
+The user accepted the next diagnostic step. Codex implemented 32-dword
+multi-line shader-store variants in the existing `hsa_remote_cache_read`
+smoke. No full gem5 simulation was started in this step.
+
+Design implemented:
+
+- Preserve all existing modes.
+- Add `--mode shader-multi-line` for GPU0 kernel stores to GPU1 target memory.
+- Add `--mode reverse-shader-multi-line` for GPU1 kernel stores to GPU0
+  target memory.
+- Reuse the existing vector reader kernel
+  `remote_cache_multi_offset_reader`.
+- Add a vector writer kernel `remote_cache_multi_offset_writer`.
+- Use `MultiLineDwords == 32`, or 128 bytes, matching the earlier SDMA
+  multi-line diagnostic width.
+- The writer kernel performs ordinary shader stores:
+  `target[i] = value_base + i`.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+First relevant result:
+
+- RED: the structural test failed because
+  `REMOTE_CACHE_READ_SHADER_MULTI_LINE_RESULT` was not present in
+  `hsa_remote_cache_read.cpp`.
+
+After implementation, Codex reran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+Result: the structural test passed.
+
+Codex rebuilt the smoke binary and HSACO:
+
+```bash
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+```
+
+Result: `remote_cache_kernels.hsaco` and `hsa_remote_cache_read` rebuilt
+successfully.
+
+Codex then ran:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+strings tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read | rg "shader-multi-line|SHADER_MULTI_LINE|remote_cache_multi_offset_writer"
+strings tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hsaco | rg "remote_cache_(multi_offset_writer|multi_offset_reader|writer|reader)"
+git diff --check
+```
+
+Result:
+
+- both pyunit tests passed;
+- the rebuilt binary contains the shader multi-line mode strings and result
+  markers;
+- the rebuilt HSACO contains `remote_cache_multi_offset_writer@kd`;
+- `git diff --check` produced no whitespace errors.
+
+Facts confirmed:
+
+- `remote_cache_kernels.hip` now defines
+  `remote_cache_multi_offset_writer`.
+- The host harness now accepts:
+  - `--mode shader-multi-line`;
+  - `--mode reverse-shader-multi-line`.
+- The host harness now prints:
+  - `REMOTE_CACHE_READ_SHADER_MULTI_LINE_ENTRY`;
+  - `REMOTE_CACHE_READ_SHADER_MULTI_LINE_RESULT`;
+  - `REMOTE_CACHE_READ_SHADER_MULTI_LINE_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_SHADER_MULTI_LINE_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_SHADER_MULTI_LINE_FAILED_UNEXPECTED`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_MULTI_LINE_ENTRY`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_MULTI_LINE_RESULT`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_MULTI_LINE_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_MULTI_LINE_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_MULTI_LINE_FAILED_UNEXPECTED`.
+- Initial target setup still uses HSA async-copy, so the diagnostic isolates
+  the remote write mechanism, not target initialization.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the multi-line non-SDMA remote-write-after-cache-read diagnostic
+  can be added as a source-only smoke extension; no gem5 rebuild is required
+  for this step.
+- Accepted: the next full simulation should first run
+  `--mode shader-multi-line`, then reverse if forward completes.
+- Not tested yet: whether the full Timing simulation observes updated, stale,
+  unexpected, or a new protocol failure for either multi-line shader-store
+  direction.
+
+Files changed:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hip`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Generated local artifacts:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.bundle`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hsaco`
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read`
+
+Verification completed:
+
+- TDD RED/GREEN structural pyunit.
+- Standalone ROCm 4.0.1 rebuild of `hsa_remote_cache_read`.
+- Related structural pyunit plus binary/HSACO string checks.
+- `git diff --check`.
+
+Single next diagnostic step: run the forward shader multi-line variant under
+Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-shader-multi-line -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode shader-multi-line' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+If that completes, run the reverse variant:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-shader-multi-line -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-shader-multi-line' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspect whether all 32 entries classify as updated, stale, or unexpected, and
+whether any new GPU_VIPER protocol failure appears.
+
+## 2026-06-29 forward shader multi-line remote-cache Timing run
+
+The user ran the forward shader multi-line variant and asked Codex to inspect
+`m5out-hsa-remote-cache-read-shader-multi-line`. Codex only performed
+read-only log inspection; no new gem5 simulation was started.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-shader-multi-line -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode shader-multi-line' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspection commands run by Codex:
+
+```bash
+rg -n "command line:|hsa_remote_cache_read|REMOTE_CACHE_READ_.*SHADER_MULTI_LINE|Exiting @ tick" m5out-hsa-remote-cache-read-shader-multi-line/simout.txt
+rg -c "REMOTE_CACHE_READ_SHADER_MULTI_LINE_ENTRY .*classification=1" m5out-hsa-remote-cache-read-shader-multi-line/simout.txt
+rg -n "classification=[23]|panic|fatal|Invalid transition|FAILED_UNEXPECTED|OBSERVED_STALE" m5out-hsa-remote-cache-read-shader-multi-line/simout.txt m5out-hsa-remote-cache-read-shader-multi-line/simerr.txt m5out-hsa-remote-cache-read-shader-multi-line/remote-cache.trace
+rg -n "AMDKFD_IOC_CREATE_QUEUE request|AMDKFD_IOC_CREATE_QUEUE assigned|doorbell route daddr|HWScheduler|SESDMAEngine|Register SDMA queue|SDMA queue|remote_cache_multi_offset_(reader|writer)|remote_cache_reader|remote_cache_writer" m5out-hsa-remote-cache-read-shader-multi-line/remote-cache.trace
+rg -n "Directory_Controller\.(DmaWrite|U\.DmaWrite|BDW_M\.(L3Hit|MemData))::total|DMA_Controller\.Ack::total|TCP_Controller\.(Load|StoreThrough|Evict)::total|TCC_Controller\.(RdBlk|WrVicBlkBack|Data|WBAck)::total" m5out-hsa-remote-cache-read-shader-multi-line/stats.txt
+```
+
+First relevant observable result:
+
+- The run completed normally:
+  `Exiting @ tick 27319667652 because exiting with last active thread context.`
+- The aggregate result was:
+  `REMOTE_CACHE_READ_SHADER_MULTI_LINE_RESULT count=32 classification=1`.
+- Final result:
+  `REMOTE_CACHE_READ_SHADER_MULTI_LINE_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- All 32 entries classified as updated.
+- Representative entries:
+  - offset 0: `first=0x11112222 second=0x33334444 classification=1`;
+  - offset 15: `first=0x11112231 second=0x33334453 classification=1`;
+  - offset 16: `first=0x11112232 second=0x33334454 classification=1`;
+  - offset 31: `first=0x11112241 second=0x33334463 classification=1`.
+- The initial target setup used `H2D_GPU1_INITIAL` with 128 bytes and
+  completed successfully.
+- The run loaded:
+  - reader symbol `remote_cache_multi_offset_reader`, object
+    `0x7ffdf6603300`;
+  - writer symbol `remote_cache_multi_offset_writer`, object
+    `0x7ffdf6a03900`.
+- The reader queue was created on GPU1:
+  - queue id 3;
+  - GPU ID `22125`;
+  - queue type 2;
+  - backend `compute`;
+  - doorbell offset `0x18`;
+  - routed to `HWScheduler`.
+- The writer queue was created on GPU0:
+  - queue id 4;
+  - GPU ID `22124`;
+  - queue type 2;
+  - backend `compute`;
+  - doorbell offset `0x20`;
+  - routed to `HWScheduler`.
+- The writer path did not use SDMA:
+  - writer doorbell had `sdma_hit 0`;
+  - writer queue 4 routed to `HWScheduler`, not `SESDMAEngine`.
+- The reader observed `first_read_done=1`, then the host dispatched
+  `GPU0_TO_GPU1_SHADER_MULTI_LINE_STORE` with `dwords=32`.
+- The vector writer dispatch completed successfully.
+- The reader observed `reader_done=1` and completed successfully.
+- No `panic`, `fatal`, `Invalid transition`, `FAILED_UNEXPECTED`,
+  `OBSERVED_STALE`, or `classification=[23]` string was found in the inspected
+  stdout, stderr, or trace files.
+- The stats show non-SDMA GPU traffic, including TCP `Load`, TCP
+  `StoreThrough`, TCP `Evict`, TCC `RdBlk`, TCC `WrVicBlkBack`, TCC `Data`,
+  and TCC `WBAck`. DMA counts remain tied to setup traffic rather than the
+  shader-store writer dispatch.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the focused GPU0-to-GPU1 shader-store
+  remote-write-after-cache-read path remains updated across 32 dwords / 128
+  bytes.
+- Accepted: the forward multi-line shader-store writer dispatch is a non-SDMA
+  GPU compute queue routed to `HWScheduler`.
+- Rejected: the forward multi-line shader-store run exposes stale data,
+  unexpected data, or a new Ruby protocol invalid transition.
+- Not proven: reverse multi-line shader-store direction, larger shader-store
+  vectors, repeated shader-store rounds, concurrent bidirectional shader
+  writes, CPU-visible coherence, arbitrary ROCm API behavior, or complete
+  multi-GPU GPU_VIPER coherence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and stats.
+- Confirmed normal simulator exit, all 32 entries updated, final updated
+  classification, and compute writer queue routing through `HWScheduler`.
+
+Single next diagnostic step: run the reverse shader multi-line variant under
+Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-shader-multi-line -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-shader-multi-line' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspect whether all 32 reverse-direction entries classify as updated and
+whether the writer still routes through the GPU1 compute queue instead of
+SDMA.
+
+## 2026-06-29 reverse shader multi-line remote-cache Timing run
+
+The user ran the reverse shader multi-line variant and asked Codex to inspect
+`m5out-hsa-remote-cache-read-reverse-shader-multi-line`. Codex only performed
+read-only log inspection; no new gem5 simulation was started.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-shader-multi-line -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-shader-multi-line' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspection commands run by Codex:
+
+```bash
+rg -n "command line:|hsa_remote_cache_read|REMOTE_CACHE_READ_.*SHADER_MULTI_LINE|Exiting @ tick" m5out-hsa-remote-cache-read-reverse-shader-multi-line/simout.txt
+rg -c "REMOTE_CACHE_READ_REVERSE_SHADER_MULTI_LINE_ENTRY .*classification=1" m5out-hsa-remote-cache-read-reverse-shader-multi-line/simout.txt
+rg -n "classification=[23]|panic|fatal|Invalid transition|FAILED_UNEXPECTED|OBSERVED_STALE" m5out-hsa-remote-cache-read-reverse-shader-multi-line/simout.txt m5out-hsa-remote-cache-read-reverse-shader-multi-line/simerr.txt m5out-hsa-remote-cache-read-reverse-shader-multi-line/remote-cache.trace
+rg -n "AMDKFD_IOC_CREATE_QUEUE request|AMDKFD_IOC_CREATE_QUEUE assigned|doorbell route daddr|HWScheduler|SESDMAEngine|Register SDMA queue|SDMA queue|remote_cache_multi_offset_(reader|writer)|remote_cache_reader|remote_cache_writer" m5out-hsa-remote-cache-read-reverse-shader-multi-line/remote-cache.trace
+rg -n "Directory_Controller\.(DmaWrite|U\.DmaWrite|BDW_M\.(L3Hit|MemData))::total|DMA_Controller\.Ack::total|TCP_Controller\.(Load|StoreThrough|Evict)::total|TCC_Controller\.(RdBlk|WrVicBlkBack|Data|WBAck)::total" m5out-hsa-remote-cache-read-reverse-shader-multi-line/stats.txt
+```
+
+First relevant observable result:
+
+- The run completed normally:
+  `Exiting @ tick 27327382596 because exiting with last active thread context.`
+- The aggregate result was:
+  `REMOTE_CACHE_READ_REVERSE_SHADER_MULTI_LINE_RESULT count=32 classification=1`.
+- Final result:
+  `REMOTE_CACHE_READ_REVERSE_SHADER_MULTI_LINE_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- All 32 reverse-direction entries classified as updated.
+- Representative entries:
+  - offset 0: `first=0x11112222 second=0x33334444 classification=1`;
+  - offset 15: `first=0x11112231 second=0x33334453 classification=1`;
+  - offset 16: `first=0x11112232 second=0x33334454 classification=1`;
+  - offset 31: `first=0x11112241 second=0x33334463 classification=1`.
+- The initial target setup used `H2D_GPU0_INITIAL` with 128 bytes and
+  completed successfully.
+- The run loaded:
+  - reader symbol `remote_cache_multi_offset_reader`, object
+    `0x7ffdf6a03300`;
+  - writer symbol `remote_cache_multi_offset_writer`, object
+    `0x7ffdf6603900`.
+- The reader queue was created on GPU0:
+  - queue id 3;
+  - GPU ID `22124`;
+  - queue type 2;
+  - backend `compute`;
+  - doorbell offset `0x18`;
+  - routed to `HWScheduler`.
+- The writer queue was created on GPU1:
+  - queue id 4;
+  - GPU ID `22125`;
+  - queue type 2;
+  - backend `compute`;
+  - doorbell offset `0x20`;
+  - routed to `HWScheduler`.
+- The writer path did not use SDMA:
+  - writer doorbell had `sdma_hit 0`;
+  - writer queue 4 routed to `HWScheduler`, not `SESDMAEngine`.
+- The reader observed `first_read_done=1`, then the host dispatched
+  `GPU1_TO_GPU0_SHADER_MULTI_LINE_STORE` with `dwords=32`.
+- The vector writer dispatch completed successfully.
+- The reader observed `reader_done=1` and completed successfully.
+- No `panic`, `fatal`, `Invalid transition`, `FAILED_UNEXPECTED`,
+  `OBSERVED_STALE`, or `classification=[23]` string was found in the inspected
+  stdout, stderr, or trace files.
+- The stats show non-SDMA GPU traffic, including TCP `Load`, TCP
+  `StoreThrough`, TCP `Evict`, TCC `RdBlk`, TCC `WrVicBlkBack`, TCC `Data`,
+  and TCC `WBAck`. DMA counts remain tied to setup traffic rather than the
+  shader-store writer dispatch.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the focused GPU1-to-GPU0 shader-store
+  remote-write-after-cache-read path remains updated across 32 dwords / 128
+  bytes.
+- Accepted: the shader multi-line diagnostic is symmetric for the 32-dword
+  forward and reverse directions in this focused setup.
+- Accepted: both multi-line shader-store writer dispatches are non-SDMA GPU
+  compute queues routed to `HWScheduler`.
+- Rejected: the reverse multi-line shader-store run exposes stale data,
+  unexpected data, or a new Ruby protocol invalid transition.
+- Not proven: larger shader-store vectors, repeated shader-store rounds,
+  concurrent bidirectional shader writes, CPU-visible coherence, arbitrary
+  ROCm API behavior, or complete multi-GPU GPU_VIPER coherence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and stats.
+- Confirmed normal simulator exit, all 32 entries updated, final updated
+  classification, and compute writer queue routing through `HWScheduler`.
+
+Single next diagnostic step: extend the shader-store vector diagnostic to a
+larger 4 KiB copy-like range, starting with forward direction, to determine
+whether the non-SDMA writer path remains updated across many cache lines.
+
+## 2026-06-29 shader large remote-cache smoke implementation
+
+Codex implemented the next suggested source-only smoke extension: 4 KiB
+shader-store vector modes. No full gem5 simulation or gem5 rebuild was
+started.
+
+Commands run by Codex:
+
+```bash
+git status --short
+git diff -- tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp tests/pyunit/stdlib/test_se_viper_multigpu.py docs/debug/se-multigpu-status.md
+rg -n "enum class RemoteCacheMode|ModeShaderMultiLine|shader_multi_line|LargeCopyDwords|run_remote_cache_shader_store_vector_round|REMOTE_CACHE_READ_SHADER_MULTI_LINE|Usage|--mode|writer_kernel_name|vector_dwords" tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp
+sed -n '450,790p' tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp
+sed -n '860,1395p' tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp
+sed -n '1395,1495p' tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+rg -a -n "shader-large|SHADER_LARGE|remote_cache_multi_offset_writer" tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read
+rg -a -n "remote_cache_(multi_offset_writer|multi_offset_reader|writer|reader)" tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hsaco
+git diff --check
+```
+
+First relevant result:
+
+- The structural pyunit had already been extended with RED assertions for
+  shader-large markers and initially failed before this source change because
+  `REMOTE_CACHE_READ_SHADER_LARGE_RESULT` was absent from
+  `hsa_remote_cache_read.cpp`.
+- After the source change, the same structural pyunit passed.
+
+Facts confirmed:
+
+- `hsa_remote_cache_read` now accepts:
+  - `--mode shader-large`;
+  - `--mode reverse-shader-large`.
+- The new modes use `LargeCopyDwords == 1024`, i.e. 4096 bytes / 4 KiB.
+- The new modes reuse the existing vector kernels:
+  - reader: `remote_cache_multi_offset_reader`;
+  - writer: `remote_cache_multi_offset_writer`.
+- Forward mode emits:
+  - `GPU0_TO_GPU1_SHADER_LARGE_STORE`;
+  - `REMOTE_CACHE_READ_SHADER_LARGE_ENTRY`;
+  - `REMOTE_CACHE_READ_SHADER_LARGE_RESULT`;
+  - `REMOTE_CACHE_READ_SHADER_LARGE_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_SHADER_LARGE_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_SHADER_LARGE_FAILED_UNEXPECTED`.
+- Reverse mode emits:
+  - `GPU1_TO_GPU0_SHADER_LARGE_STORE`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_ENTRY`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_RESULT`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_FAILED_UNEXPECTED`.
+- The rebuilt host binary contains the new `shader-large` strings and
+  `SHADER_LARGE` markers.
+- The existing HSACO contains all four required kernel symbols:
+  `remote_cache_reader`, `remote_cache_multi_offset_reader`,
+  `remote_cache_writer`, and `remote_cache_multi_offset_writer`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: this is a source-only test-program extension; no gem5 rebuild is
+  required.
+- Accepted: the 4 KiB shader-store diagnostic should route the writer through a
+  compute queue/HWScheduler, like the 32-dword shader multi-line modes, not
+  through SDMA.
+- Not yet tested: whether the forward or reverse 4 KiB shader-store run
+  classifies all entries as updated under full Timing simulation.
+
+Files changed:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- Structural pyunit:
+  `test_remote_write_after_cache_read_smoke_has_same_dispatch_reader` passed.
+- Related pyunits:
+  `test_remote_write_after_cache_read_smoke_has_same_dispatch_reader` and
+  `test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks`
+  passed together.
+- `make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ...`
+  completed successfully with the `.deps` ROCm 4.0.1 toolchain.
+- Binary string checks found the new shader-large markers and confirmed the
+  required HSACO kernel symbols.
+- `git diff --check` produced no output.
+
+Generated or refreshed local artifacts:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read`
+
+Single next diagnostic step: run the forward 4 KiB shader-store variant under
+Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-shader-large -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode shader-large' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+If the forward run completes and all 1024 entries classify as updated, run the
+reverse 4 KiB variant:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-shader-large -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-shader-large' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-06-29 forward shader large remote-cache Timing run
+
+The user ran the forward 4 KiB shader-store variant and asked Codex to inspect
+`m5out-hsa-remote-cache-read-shader-large`. Codex only performed read-only log
+inspection; no new gem5 simulation was started.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-shader-large -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode shader-large' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspection commands run by Codex:
+
+```bash
+ls -lh m5out-hsa-remote-cache-read-shader-large
+rg -n "command line:|hsa_remote_cache_read|REMOTE_CACHE_READ_.*SHADER_LARGE|Exiting @ tick|panic|fatal|Invalid transition" m5out-hsa-remote-cache-read-shader-large/simout.txt m5out-hsa-remote-cache-read-shader-large/simerr.txt
+rg -c "REMOTE_CACHE_READ_SHADER_LARGE_ENTRY .*classification=1" m5out-hsa-remote-cache-read-shader-large/simout.txt
+rg -n "REMOTE_CACHE_READ_SHADER_LARGE_ENTRY .*classification=[23]|FAILED_UNEXPECTED|OBSERVED_STALE" m5out-hsa-remote-cache-read-shader-large/simout.txt m5out-hsa-remote-cache-read-shader-large/simerr.txt
+rg -n "AMDKFD_IOC_CREATE_QUEUE request|AMDKFD_IOC_CREATE_QUEUE assigned|doorbell route daddr|HWScheduler|SESDMAEngine|Register SDMA queue|SDMA queue|remote_cache_multi_offset_(reader|writer)|remote_cache_reader|remote_cache_writer|GPU0_TO_GPU1_SHADER_LARGE_STORE" m5out-hsa-remote-cache-read-shader-large/remote-cache.trace
+rg -n "Directory_Controller\.(DmaWrite|U\.DmaWrite|BDW_M\.(L3Hit|MemData))::total|DMA_Controller\.Ack::total|TCP_Controller\.(Load|StoreThrough|Evict)::total|TCC_Controller\.(RdBlk|WrVicBlkBack|Data|WBAck)::total|system\.ruby\.network" m5out-hsa-remote-cache-read-shader-large/stats.txt
+rg -n "REMOTE_CACHE_READ_SHADER_LARGE_(ENTRY offset=(0|1|15|16|63|64|127|128|255|256|511|512|1022|1023)|RESULT|PASSED_UPDATED)|Exiting @ tick" m5out-hsa-remote-cache-read-shader-large/simout.txt
+rg -n "panic|fatal|Invalid transition|FAILED_UNEXPECTED|OBSERVED_STALE|classification=[23]" m5out-hsa-remote-cache-read-shader-large/simout.txt m5out-hsa-remote-cache-read-shader-large/simerr.txt m5out-hsa-remote-cache-read-shader-large/remote-cache.trace
+rg -n "queue_id (3|4)|doorbell route daddr 0x(18|20)|remote_cache_multi_offset_(reader|writer)|GPU0_TO_GPU1_SHADER_LARGE_STORE" m5out-hsa-remote-cache-read-shader-large/remote-cache.trace m5out-hsa-remote-cache-read-shader-large/simout.txt
+```
+
+First relevant observable result:
+
+- The run completed normally:
+  `Exiting @ tick 30837877920 because exiting with last active thread context.`
+- The aggregate result was:
+  `REMOTE_CACHE_READ_SHADER_LARGE_RESULT count=1024 classification=1`.
+- Final result:
+  `REMOTE_CACHE_READ_SHADER_LARGE_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- All 1024 entries classified as updated:
+  `rg -c "REMOTE_CACHE_READ_SHADER_LARGE_ENTRY .*classification=1"` returned
+  `1024`.
+- Representative entries:
+  - offset 0: `first=0x11112222 second=0x33334444 classification=1`;
+  - offset 63: `first=0x11112261 second=0x33334483 classification=1`;
+  - offset 64: `first=0x11112262 second=0x33334484 classification=1`;
+  - offset 511: `first=0x11112421 second=0x33334643 classification=1`;
+  - offset 512: `first=0x11112422 second=0x33334644 classification=1`;
+  - offset 1023: `first=0x11112621 second=0x33334843 classification=1`.
+- The initial target setup used `H2D_GPU1_INITIAL` with 4096 bytes and
+  completed successfully.
+- The run loaded:
+  - reader symbol `remote_cache_multi_offset_reader`, object
+    `0x7ffdf6603300`;
+  - writer symbol `remote_cache_multi_offset_writer`, object
+    `0x7ffdf6a03900`.
+- The reader queue was created on GPU1:
+  - queue id 3;
+  - GPU ID `22125`;
+  - queue type 2;
+  - backend `compute`;
+  - doorbell offset `0x18`;
+  - routed to `HWScheduler`.
+- The writer queue was created on GPU0:
+  - queue id 4;
+  - GPU ID `22124`;
+  - queue type 2;
+  - backend `compute`;
+  - doorbell offset `0x20`;
+  - routed to `HWScheduler`.
+- The writer path did not use SDMA:
+  - writer doorbell had `sdma_hit 0`;
+  - writer queue 4 routed to `HWScheduler`, not `SESDMAEngine`.
+- The reader observed `first_read_done=1`, then the host dispatched
+  `GPU0_TO_GPU1_SHADER_LARGE_STORE` with `dwords=1024`.
+- The vector writer dispatch completed successfully.
+- The reader observed `reader_done=1` and completed successfully.
+- No `panic`, `fatal`, `Invalid transition`, `FAILED_UNEXPECTED`,
+  `OBSERVED_STALE`, or `classification=[23]` string was found in the inspected
+  stdout, stderr, or trace files.
+- The stats show non-SDMA GPU traffic, including TCP `Load`, TCP
+  `StoreThrough`, TCP `Evict`, TCC `RdBlk`, TCC `WrVicBlkBack`, TCC `Data`,
+  and TCC `WBAck`. DMA counts remain tied to setup traffic rather than the
+  shader-store writer dispatch.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the focused GPU0-to-GPU1 shader-store
+  remote-write-after-cache-read path remains updated across 1024 dwords /
+  4096 bytes.
+- Accepted: the forward 4 KiB shader-store writer dispatch is a non-SDMA GPU
+  compute queue routed to `HWScheduler`.
+- Rejected: the forward 4 KiB shader-store run exposes stale data, unexpected
+  data, or a new Ruby protocol invalid transition.
+- Not proven: reverse 4 KiB shader-store direction, repeated large
+  shader-store rounds, concurrent bidirectional shader writes,
+  CPU-visible coherence, arbitrary ROCm API behavior, or complete multi-GPU
+  GPU_VIPER coherence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and stats.
+- Confirmed normal simulator exit, all 1024 entries updated, final updated
+  classification, and compute writer queue routing through `HWScheduler`.
+
+Single next diagnostic step: run the reverse 4 KiB shader-store variant under
+Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-shader-large -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-shader-large' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-06-29 reverse shader large remote-cache Timing run
+
+The user ran the reverse 4 KiB shader-store variant and asked Codex to inspect
+`m5out-hsa-remote-cache-read-reverse-shader-large`. Codex only performed
+read-only log inspection; no new gem5 simulation was started.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-shader-large -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-shader-large' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Inspection commands run by Codex:
+
+```bash
+ls -lh m5out-hsa-remote-cache-read-reverse-shader-large
+rg -n "command line:|hsa_remote_cache_read|REMOTE_CACHE_READ_.*SHADER_LARGE|Exiting @ tick|panic|fatal|Invalid transition" m5out-hsa-remote-cache-read-reverse-shader-large/simout.txt m5out-hsa-remote-cache-read-reverse-shader-large/simerr.txt
+rg -c "REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_ENTRY .*classification=1" m5out-hsa-remote-cache-read-reverse-shader-large/simout.txt
+rg -n "REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_ENTRY .*classification=[23]|FAILED_UNEXPECTED|OBSERVED_STALE" m5out-hsa-remote-cache-read-reverse-shader-large/simout.txt m5out-hsa-remote-cache-read-reverse-shader-large/simerr.txt
+rg -n "AMDKFD_IOC_CREATE_QUEUE request|AMDKFD_IOC_CREATE_QUEUE assigned|doorbell route daddr|HWScheduler|SESDMAEngine|Register SDMA queue|SDMA queue|remote_cache_multi_offset_(reader|writer)|remote_cache_reader|remote_cache_writer|GPU1_TO_GPU0_SHADER_LARGE_STORE" m5out-hsa-remote-cache-read-reverse-shader-large/remote-cache.trace
+rg -n "Directory_Controller\.(DmaWrite|U\.DmaWrite|BDW_M\.(L3Hit|MemData))::total|DMA_Controller\.Ack::total|TCP_Controller\.(Load|StoreThrough|Evict)::total|TCC_Controller\.(RdBlk|WrVicBlkBack|Data|WBAck)::total|system\.ruby\.network" m5out-hsa-remote-cache-read-reverse-shader-large/stats.txt
+rg -n "REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_(ENTRY offset=(0|1|15|16|63|64|127|128|255|256|511|512|1022|1023)|RESULT|PASSED_UPDATED)|Exiting @ tick" m5out-hsa-remote-cache-read-reverse-shader-large/simout.txt
+rg -n "panic|fatal|Invalid transition|FAILED_UNEXPECTED|OBSERVED_STALE|classification=[23]" m5out-hsa-remote-cache-read-reverse-shader-large/simout.txt m5out-hsa-remote-cache-read-reverse-shader-large/simerr.txt m5out-hsa-remote-cache-read-reverse-shader-large/remote-cache.trace
+rg -n "queue_id (3|4)|doorbell route daddr 0x(18|20)|remote_cache_multi_offset_(reader|writer)|GPU1_TO_GPU0_SHADER_LARGE_STORE" m5out-hsa-remote-cache-read-reverse-shader-large/remote-cache.trace m5out-hsa-remote-cache-read-reverse-shader-large/simout.txt
+```
+
+First relevant observable result:
+
+- The run completed normally:
+  `Exiting @ tick 30888389358 because exiting with last active thread context.`
+- The aggregate result was:
+  `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_RESULT count=1024 classification=1`.
+- Final result:
+  `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- All 1024 entries classified as updated:
+  `rg -c "REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_ENTRY .*classification=1"`
+  returned `1024`.
+- Representative entries:
+  - offset 0: `first=0x11112222 second=0x33334444 classification=1`;
+  - offset 63: `first=0x11112261 second=0x33334483 classification=1`;
+  - offset 64: `first=0x11112262 second=0x33334484 classification=1`;
+  - offset 511: `first=0x11112421 second=0x33334643 classification=1`;
+  - offset 512: `first=0x11112422 second=0x33334644 classification=1`;
+  - offset 1023: `first=0x11112621 second=0x33334843 classification=1`.
+- The initial target setup used `H2D_GPU0_INITIAL` with 4096 bytes and
+  completed successfully.
+- The run loaded:
+  - reader symbol `remote_cache_multi_offset_reader`, object
+    `0x7ffdf6a03300`;
+  - writer symbol `remote_cache_multi_offset_writer`, object
+    `0x7ffdf6603900`.
+- The reader queue was created on GPU0:
+  - queue id 3;
+  - GPU ID `22124`;
+  - queue type 2;
+  - backend `compute`;
+  - doorbell offset `0x18`;
+  - routed to `HWScheduler`.
+- The writer queue was created on GPU1:
+  - queue id 4;
+  - GPU ID `22125`;
+  - queue type 2;
+  - backend `compute`;
+  - doorbell offset `0x20`;
+  - routed to `HWScheduler`.
+- The writer path did not use SDMA:
+  - writer doorbell had `sdma_hit 0`;
+  - writer queue 4 routed to `HWScheduler`, not `SESDMAEngine`.
+- The reader observed `first_read_done=1`, then the host dispatched
+  `GPU1_TO_GPU0_SHADER_LARGE_STORE` with `dwords=1024`.
+- The vector writer dispatch completed successfully.
+- The reader observed `reader_done=1` and completed successfully.
+- No `panic`, `fatal`, `Invalid transition`, `FAILED_UNEXPECTED`,
+  `OBSERVED_STALE`, or `classification=[23]` string was found in the inspected
+  stdout, stderr, or trace files.
+- The stats show non-SDMA GPU traffic, including TCP `Load`, TCP
+  `StoreThrough`, TCP `Evict`, TCC `RdBlk`, TCC `WrVicBlkBack`, TCC `Data`,
+  and TCC `WBAck`. DMA counts remain tied to setup traffic rather than the
+  shader-store writer dispatch.
+- The program stdout currently prints `hsa_queue_create GPU0 writer` for this
+  reverse shader-large run, but the trace shows the writer queue is actually
+  GPU1 queue id 4. This is a diagnostic-label issue in the smoke output, not a
+  routing issue.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the focused GPU1-to-GPU0 shader-store
+  remote-write-after-cache-read path remains updated across 1024 dwords /
+  4096 bytes.
+- Accepted: the reverse 4 KiB shader-store writer dispatch is a non-SDMA GPU
+  compute queue routed to `HWScheduler`.
+- Accepted: the forward and reverse 4 KiB shader-store diagnostics are
+  symmetric in this focused setup.
+- Rejected: the reverse 4 KiB shader-store run exposes stale data, unexpected
+  data, or a new Ruby protocol invalid transition.
+- Not proven: repeated large shader-store rounds, concurrent bidirectional
+  shader writes, CPU-visible coherence, arbitrary ROCm API behavior, or
+  complete multi-GPU GPU_VIPER coherence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and stats.
+- Confirmed normal simulator exit, all 1024 entries updated, final updated
+  classification, and compute writer queue routing through `HWScheduler`.
+
+Single next diagnostic step: add a repeated 4 KiB shader-store mode to
+`hsa_remote_cache_read` to run two consecutive remote shader writes over the
+same 4 KiB range, and while touching the smoke source, fix the misleading
+reverse shader-vector writer queue label.
+
+## 2026-06-29 repeated shader large smoke implementation
+
+Codex implemented the next source-only diagnostic extension: repeated 4 KiB
+shader-store modes. No full gem5 simulation or gem5 rebuild was started.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/brainstorming/SKILL.md
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/test-driven-development/SKILL.md
+sed -n '1,160p' AGENTS.md
+tail -180 docs/debug/se-multigpu-status.md
+git status --short
+rg -n "shader-large|reverse-shader-large|REMOTE_CACHE_READ_SHADER_LARGE|REMOTE_CACHE_READ_REVERSE_SHADER_LARGE|hsa_queue_create GPU0 writer|writer_queue|run_remote_cache_shader_store_vector_round|ModeShaderLarge|ModeReverseShaderLarge|shader_vector_direction|test_remote_write_after_cache_read" tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp tests/pyunit/stdlib/test_se_viper_multigpu.py
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+sed -n '1,220p' tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hip
+sed -n '660,790p' tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp
+sed -n '870,990p' tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp
+sed -n '1240,1430p' tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader test_se_viper_multigpu.SEViperMultiGPUTest.test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks
+rg -a -n "shader-large-repeated|reverse-shader-large-repeated|SHADER_LARGE_REPEATED|hsa_queue_create GPU1 writer|hsa_queue_create GPU0 writer" tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read
+rg -n "shader-large-repeated|reverse-shader-large-repeated|SHADER_LARGE_REPEATED|reverse_shader_vector|ModeShaderLargeRepeated|ModeReverseShaderLargeRepeated" tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp tests/pyunit/stdlib/test_se_viper_multigpu.py
+git diff --check
+```
+
+First relevant result:
+
+- RED: after adding structural assertions, the pyunit failed as expected with:
+  `AssertionError: 'shader-large-repeated' not found`, confirming the new
+  repeated shader-large modes were not yet implemented.
+- After implementation, the same structural pyunit passed.
+
+Facts confirmed:
+
+- `hsa_remote_cache_read` now accepts:
+  - `--mode shader-large-repeated`;
+  - `--mode reverse-shader-large-repeated`.
+- The repeated modes run two consecutive 4 KiB vector shader-store rounds over
+  the same target range:
+  - round 1 expects `ValueA + i` then writes/observes `ValueB + i`;
+  - round 2 expects `ValueB + i` then writes/observes `ValueC + i`.
+- The repeated modes reuse the existing vector kernels:
+  - reader: `remote_cache_multi_offset_reader`;
+  - writer: `remote_cache_multi_offset_writer`.
+- Forward repeated mode emits:
+  - `REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_ROUND`;
+  - `REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_RESULT`;
+  - `REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_FAILED_UNEXPECTED`.
+- Reverse repeated mode emits:
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_ROUND`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_RESULT`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_PASSED_UPDATED`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_OBSERVED_STALE`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_FAILED_UNEXPECTED`.
+- The final repeated PASS marker is printed only when both rounds classify as
+  `RemoteCacheUpdated`.
+- The misleading reverse shader-vector writer queue label was fixed by using
+  `reverse_shader_vector` in the writer queue status label. This preserves the
+  older `reverse-shader-store` GPU1 label behavior as well.
+- The rebuilt host binary contains the new repeated mode strings, repeated
+  result markers, and both GPU0/GPU1 writer queue labels.
+
+Hypotheses accepted or rejected:
+
+- Accepted: this is a source-only test-program extension; no gem5 rebuild is
+  required.
+- Accepted: repeated 4 KiB shader-store diagnostics should continue to route
+  writer dispatches through compute queues/HWScheduler, not through SDMA.
+- Not yet tested: whether the forward or reverse repeated 4 KiB shader-store
+  run classifies both rounds as updated under full Timing simulation.
+
+Files changed:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- Structural pyunit RED/GREEN for the new repeated modes.
+- Related pyunits:
+  `test_remote_write_after_cache_read_smoke_has_same_dispatch_reader` and
+  `test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks`
+  passed together.
+- `make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ...`
+  completed successfully with the `.deps` ROCm 4.0.1 toolchain.
+- Binary string checks found the new repeated markers and writer queue labels.
+- `git diff --check` produced no output.
+
+Generated or refreshed local artifacts:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read`
+
+Single next diagnostic step: run the forward repeated 4 KiB shader-store
+variant under Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-shader-large-repeated -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode shader-large-repeated' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+If the forward repeated run completes and both 1024-entry rounds classify as
+updated, run the reverse repeated 4 KiB variant:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-shader-large-repeated -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-shader-large-repeated' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-06-29 forward repeated shader-large Timing run
+
+The user ran the forward repeated 4 KiB shader-store remote-cache diagnostic
+and asked Codex to inspect `m5out-hsa-remote-cache-read-shader-large-repeated`.
+Codex inspected the stdout, stderr, debug trace, and stats files only; no long
+simulation was started.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-shader-large-repeated -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode shader-large-repeated' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read-shader-large-repeated/simout.txt`
+- `m5out-hsa-remote-cache-read-shader-large-repeated/simerr.txt`
+- `m5out-hsa-remote-cache-read-shader-large-repeated/remote-cache.trace`
+- `m5out-hsa-remote-cache-read-shader-large-repeated/stats.txt`
+
+Inspection commands run by Codex:
+
+```bash
+ls -lh m5out-hsa-remote-cache-read-shader-large-repeated
+rg -n "command line:|REMOTE_CACHE_READ_SHADER_LARGE_REPEATED|Exiting @|panic|fatal|Invalid transition|OBSERVED_STALE|FAILED_UNEXPECTED|classification=[23]" m5out-hsa-remote-cache-read-shader-large-repeated/simout.txt m5out-hsa-remote-cache-read-shader-large-repeated/simerr.txt m5out-hsa-remote-cache-read-shader-large-repeated/remote-cache.trace
+rg -c "REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_ROUND round=1 .*classification=1" m5out-hsa-remote-cache-read-shader-large-repeated/simout.txt
+rg -c "REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_ROUND round=2 .*classification=1" m5out-hsa-remote-cache-read-shader-large-repeated/simout.txt
+rg -n "REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_ROUND round=(1|2) offset=(0|63|64|511|512|1023) |REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_RESULT|REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_PASSED_UPDATED|Exiting @" m5out-hsa-remote-cache-read-shader-large-repeated/simout.txt
+rg -n "panic|fatal|Invalid transition|FAILED_UNEXPECTED|OBSERVED_STALE|classification=[23]" m5out-hsa-remote-cache-read-shader-large-repeated/simout.txt m5out-hsa-remote-cache-read-shader-large-repeated/simerr.txt m5out-hsa-remote-cache-read-shader-large-repeated/remote-cache.trace || true
+rg -n "hsa_queue_create GPU|doorbell|QueueType|SESDMA|HWScheduler|GPU0 writer|GPU1 writer|sdma_hit" m5out-hsa-remote-cache-read-shader-large-repeated/remote-cache.trace | sed -n '1,220p'
+rg -n "system\\.(ruby|gpus|network).*(Load|Store|Evict|Wr|Rd|TCC|TCP|DMA|L3)|dma" m5out-hsa-remote-cache-read-shader-large-repeated/stats.txt | sed -n '1,160p'
+```
+
+First relevant observable result:
+
+- The run completed normally:
+  `Exiting @ tick 35573523201 because exiting with last active thread context.`
+- Both repeated rounds produced updated classifications:
+  - `REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_RESULT round=1 count=1024 classification=1`
+  - `REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_RESULT round=2 count=1024 classification=1`
+- The final marker was:
+  `REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- Round 1 had 1024 entries matching `classification=1`.
+- Round 2 had 1024 entries matching `classification=1`.
+- Representative values confirm the intended sequence:
+  - round 1 offset 0: `0x11112222 -> 0x33334444`;
+  - round 1 offset 1023: `0x11112621 -> 0x33334843`;
+  - round 2 offset 0: `0x33334444 -> 0x55556666`;
+  - round 2 offset 1023: `0x33334843 -> 0x55556a65`.
+- No `panic`, `fatal`, `Invalid transition`,
+  `REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_OBSERVED_STALE`,
+  `REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_FAILED_UNEXPECTED`, or
+  `classification=2/3` marker was found in stdout, stderr, or the debug trace.
+- The initial H2D setup used the SE SDMA queue on GPU1, as expected.
+- The remote-cache reader queue and writer queue for the repeated shader-store
+  test were compute queues routed to `HWScheduler`, not SDMA:
+  - reader queue id 3 on GPU1, queue type 2, doorbell offset `0x18`,
+    `sdma_hit 0`;
+  - writer queue id 4 on GPU0, queue type 2, doorbell offset `0x20`,
+    `sdma_hit 0`.
+- Both repeated rounds rang the same reader and writer compute doorbells:
+  - reader: ticks `26738496405` and `30981488166`;
+  - writer: ticks `26829047097` and `31063030209`.
+- Stats show Ruby/network traffic and SDMA activity for setup, but the repeated
+  remote writes themselves were shader dispatches rather than SDMA packets.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the forward GPU0-to-GPU1 repeated 4 KiB shader-store diagnostic
+  observes updated values in both rounds under Timing CPU.
+- Accepted: the repeated shader-store writer path is a compute/HWScheduler path
+  and is not accidentally using the SESDMAEngine.
+- Rejected for this run: the second round exposes stale data, unexpected data,
+  a protocol invalid transition, or a gem5 panic/fatal.
+- Not proven by this run: reverse direction behavior, more than two repeated
+  rounds, concurrent bidirectional writes, CPU-visible coherence, arbitrary
+  ROCm API behavior, or complete multi-GPU GPU_VIPER coherence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, debug trace, and stats.
+- Counted both repeated rounds and confirmed 1024 updated entries per round.
+- Checked for panic/fatal/invalid-transition/stale/unexpected markers and found
+  none.
+- Confirmed queue routing evidence for reader and writer dispatches in the
+  debug trace.
+
+Single next diagnostic step: run the reverse repeated 4 KiB shader-store
+variant under Timing CPU:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-shader-large-repeated -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-shader-large-repeated' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-06-29 reverse repeated shader-large Timing run
+
+The user ran the reverse repeated 4 KiB shader-store remote-cache diagnostic
+and asked Codex to inspect
+`m5out-hsa-remote-cache-read-reverse-shader-large-repeated`. Codex inspected
+the stdout, stderr, debug trace, and stats files only; no long simulation was
+started.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-reverse-shader-large-repeated -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode reverse-shader-large-repeated' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read-reverse-shader-large-repeated/simout.txt`
+- `m5out-hsa-remote-cache-read-reverse-shader-large-repeated/simerr.txt`
+- `m5out-hsa-remote-cache-read-reverse-shader-large-repeated/remote-cache.trace`
+- `m5out-hsa-remote-cache-read-reverse-shader-large-repeated/stats.txt`
+
+Inspection commands run by Codex:
+
+```bash
+ls -lh m5out-hsa-remote-cache-read-reverse-shader-large-repeated
+rg -n "command line:|REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED|Exiting @|panic|fatal|Invalid transition|OBSERVED_STALE|FAILED_UNEXPECTED|classification=[23]" m5out-hsa-remote-cache-read-reverse-shader-large-repeated/simout.txt m5out-hsa-remote-cache-read-reverse-shader-large-repeated/simerr.txt m5out-hsa-remote-cache-read-reverse-shader-large-repeated/remote-cache.trace
+rg -c "REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_ROUND round=1 .*classification=1" m5out-hsa-remote-cache-read-reverse-shader-large-repeated/simout.txt
+rg -c "REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_ROUND round=2 .*classification=1" m5out-hsa-remote-cache-read-reverse-shader-large-repeated/simout.txt
+rg -n "REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_RESULT|REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_PASSED_UPDATED|Exiting @" m5out-hsa-remote-cache-read-reverse-shader-large-repeated/simout.txt
+rg -n "REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_ROUND round=1 offset=(0|63|64|511|512|1023) |REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_ROUND round=2 offset=(0|63|64|511|512|1023) " m5out-hsa-remote-cache-read-reverse-shader-large-repeated/simout.txt
+rg -n "panic|fatal|Invalid transition|FAILED_UNEXPECTED|OBSERVED_STALE|classification=[23]" m5out-hsa-remote-cache-read-reverse-shader-large-repeated/simout.txt m5out-hsa-remote-cache-read-reverse-shader-large-repeated/simerr.txt m5out-hsa-remote-cache-read-reverse-shader-large-repeated/remote-cache.trace || true
+rg -n "AMDKFD_IOC_CREATE_QUEUE assigned queue_id (3|4)|doorbell route daddr (0x18|0x20)|doorbell route queue_id (3|4)|unsetDeviceQueueDesc queue_id (3|4)|registerSDMAQueue" m5out-hsa-remote-cache-read-reverse-shader-large-repeated/remote-cache.trace
+rg -n "phys_mem\\.(bytesRead|bytesWritten|numReads|numWrites)::gpus[01]\\.se_sdma_engine|ruby_system\\.network\\.msg_count\\.(Writeback|Request|Response|Unblock)|dma_controllers[0-9].*m_msg_count" m5out-hsa-remote-cache-read-reverse-shader-large-repeated/stats.txt | sed -n '1,180p'
+```
+
+First relevant observable result:
+
+- The run completed normally:
+  `Exiting @ tick 35672163462 because exiting with last active thread context.`
+- Both repeated reverse rounds produced updated classifications:
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_RESULT round=1 count=1024 classification=1`
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_RESULT round=2 count=1024 classification=1`
+- The final marker was:
+  `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- Round 1 had 1024 entries matching `classification=1`.
+- Round 2 had 1024 entries matching `classification=1`.
+- Representative values confirm the intended sequence:
+  - round 1 offset 0: `0x11112222 -> 0x33334444`;
+  - round 1 offset 1023: `0x11112621 -> 0x33334843`;
+  - round 2 offset 0: `0x33334444 -> 0x55556666`;
+  - round 2 offset 1023: `0x33334843 -> 0x55556a65`.
+- No `panic`, `fatal`, `Invalid transition`,
+  `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_OBSERVED_STALE`,
+  `REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_FAILED_UNEXPECTED`, or
+  `classification=2/3` marker was found in stdout, stderr, or the debug trace.
+- The initial H2D setup used the SE SDMA queue on GPU0, as expected for the
+  reverse-direction setup.
+- The reverse repeated reader and writer queues were compute queues routed to
+  `HWScheduler`, not SDMA:
+  - reader queue id 3 on GPU0, queue type 2, doorbell offset `0x18`,
+    `sdma_hit 0`;
+  - writer queue id 4 on GPU1, queue type 2, doorbell offset `0x20`,
+    `sdma_hit 0`.
+- Both repeated reverse rounds rang the same reader and writer compute
+  doorbells:
+  - reader: ticks `26745127101` and `31032861075`;
+  - writer: ticks `26835300504` and `31114561959`.
+- Stats show Ruby/network traffic and SDMA activity for setup, but the repeated
+  reverse remote writes themselves were shader dispatches rather than SDMA
+  packets.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the reverse GPU1-to-GPU0 repeated 4 KiB shader-store diagnostic
+  observes updated values in both rounds under Timing CPU.
+- Accepted: both forward and reverse repeated shader-store writer paths are
+  compute/HWScheduler paths and are not accidentally using the SESDMAEngine for
+  the remote write phase.
+- Rejected for this run: the reverse second round exposes stale data,
+  unexpected data, a protocol invalid transition, or a gem5 panic/fatal.
+- Not proven by this run: more than two repeated rounds, concurrent
+  bidirectional writes, CPU-visible coherence, arbitrary ROCm API behavior, or
+  complete multi-GPU GPU_VIPER coherence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, debug trace, and stats.
+- Counted both reverse repeated rounds and confirmed 1024 updated entries per
+  round.
+- Checked for panic/fatal/invalid-transition/stale/unexpected markers and found
+  none.
+- Confirmed queue routing evidence for reader and writer dispatches in the
+  debug trace.
+
+Single next diagnostic step: do not implement a separate-dispatch reader as a
+pure coherence litmus until kernel-boundary acquire is controlled. Inspect the
+kernel launch acquire path and decide whether to add per-GPU acquire-disable
+controls for cache-persistence diagnostics, or continue using same-dispatch
+resident-reader tests when the goal is to avoid implicit TCP invalidation.
+
+## 2026-06-29 kernel-boundary acquire caveat for separate-dispatch readers
+
+The user pointed out that the proposed separate-dispatch reader test would
+cross kernel launch/end boundaries. In `GPU_VIPER`, kernel launch acquire can
+invalidate GPU caches, so a second reader kernel may observe updated data
+because its TCP was invalidated at launch rather than because a multi-GPU
+coherence/invalidation path preserved correctness without that boundary.
+
+Commands run by Codex:
+
+```bash
+sed -n '500,550p' configs/example/apu_se.py
+rg -n "acquire|release|TCP|flush|cache" configs/example/apu_se.py configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py src/gpu-compute src/dev/hsa src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm | sed -n '1,220p'
+sed -n '80,180p' configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py
+rg -n "impl_kern_launch_acq|impl_kern_end_rel|disable_gpu" -S configs src python gem5 | sed -n '1,220p'
+sed -n '140,190p' src/gpu-compute/dispatcher.cc
+sed -n '1540,1585p' src/gpu-compute/compute_unit.cc
+sed -n '190,218p' src/python/gem5/components/devices/gpus/viper_shader.py
+sed -n '145,165p' src/python/gem5/components/devices/gpus/se_viper_gpu.py
+```
+
+First relevant observable result:
+
+- `apu_se.py` documents that `GPU_VIPER` uses release consistency and sets:
+  - `shader.impl_kern_launch_acq = True`;
+  - `shader.impl_kern_end_rel = False`.
+- `src/gpu-compute/dispatcher.cc` confirms that when
+  `impl_kern_launch_acq` is true, dispatch starts by calling
+  `shader->prepareInvalidate(task)`.
+- `src/gpu-compute/compute_unit.cc` confirms that the kernel-launch path sends
+  a `MemSyncReq` with `Request::INV_L1`.
+- At the time of this source inspection, the multi-GPU SE script had only
+  GPU0-specific launch-acquire control. This asymmetry needed to be replaced
+  with a generic per-GPU control.
+
+Facts confirmed:
+
+- A separate-dispatch reader is still useful as a synchronized functional test:
+  it checks visibility after HSA/kernel dispatch acquire semantics.
+- A separate-dispatch reader is not a clean cache-coherence litmus if the goal
+  is to test whether a remote write invalidates or updates a stale TCP line
+  without kernel-boundary invalidation.
+- Existing same-dispatch resident-reader tests better avoid implicit launch
+  acquire between the first read and the second read.
+- Existing command-line control is asymmetric: GPU0 acquire can be disabled,
+  but GPU1 acquire cannot yet be disabled in the multi-GPU script.
+
+Hypotheses accepted or rejected:
+
+- Accepted: kernel-boundary acquire can mask a stale-cache problem in
+  separate-dispatch tests by invalidating TCP at the second reader launch.
+- Accepted: if the research question is pure multi-GPU cache coherence, the
+  same-dispatch resident-reader pattern remains the more direct litmus.
+- Rejected: separate-dispatch reader should be the next pure coherence
+  diagnostic without first controlling acquire behavior.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only source inspection of `apu_se.py`, the multi-GPU SE config,
+  dispatcher acquire handling, and CU memory-sync request creation.
+
+Single next diagnostic step: add symmetric command-line controls to the
+multi-GPU SE script for disabling kernel-launch acquire per GPU, then use them
+only for cache-persistence diagnostics. After that, a separate-dispatch reader
+can be run in two modes: default synchronized mode and acquire-disabled
+diagnostic mode.
+
+## 2026-06-29 per-GPU kernel-launch acquire disable control
+
+The user asked to execute the next step from the acquire caveat. Codex
+implemented only the configuration control needed before a separate-dispatch
+reader can be interpreted cleanly. No gem5 build or long simulation was
+started.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_xgmi_multigpu_config_can_disable_launch_acquire_per_gpu
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_xgmi_multigpu_config_can_disable_launch_acquire_per_gpu
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_xgmi_multigpu_config_can_disable_launch_acquire_per_gpu test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_xgmi_multigpu_config_can_disable_launch_acquire_per_gpu test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_peer_invalidate_diagnostic_has_host_sequenced_phases test_se_viper_multigpu.SEViperMultiGPUTest.test_xgmi_multigpu_config_can_disable_launch_acquire_per_gpu test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu
+git diff --check
+```
+
+First relevant observable result:
+
+- RED: the new structural pyunit initially failed with:
+  `AssertionError: '--disable-gpu-kernel-launch-acquire' not found`.
+- GREEN: after the config change, the new structural pyunit passed.
+- The paired config/remote-cache structural tests also passed:
+  `Ran 2 tests in 0.001s OK`.
+- After user review, the GPU0-specific compatibility option was removed.
+  The related peer-invalidate/config/remote-cache structural tests passed
+  together: `Ran 3 tests in 0.001s OK`.
+- The broader `test_se_viper_multigpu` run still has one unrelated structural
+  failure in `test_kfd_normal_operations_use_debug_tracing`:
+  `AssertionError: 'AMDKFD_IOC_CREATE_QUEUE gpu_id' not found`. The current
+  driver source contains `AMDKFD_IOC_CREATE_QUEUE request gpu_id ...`, so this
+  failure is a pre-existing string-expectation mismatch outside the acquire
+  control change.
+- `git diff --check` produced no output.
+
+Facts confirmed:
+
+- `configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py` now supports a
+  repeatable generic option:
+  `--disable-gpu-kernel-launch-acquire GPU_INDEX`.
+- The old `--disable-gpu0-kernel-launch-acquire` option was removed after user
+  review; only the generic per-GPU option remains.
+- GPU indices are validated against `--num-gpus`; invalid indices raise
+  `ValueError`.
+- Each selected GPU gets:
+  `gpus[gpu_index].impl_kern_launch_acq = False`.
+- This is a Python configuration change only; a gem5 rebuild is not required.
+
+Hypotheses accepted or rejected:
+
+- Accepted: symmetric per-GPU launch-acquire control is now available for
+  cache-persistence diagnostics.
+- Accepted: disabling launch acquire should be used only for diagnostics where
+  implicit TCP invalidation would otherwise mask stale-cache behavior.
+- Not yet tested: separate-dispatch reader behavior with default acquire
+  enabled or acquire disabled.
+
+Files changed:
+
+- `configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- TDD RED/GREEN for the new generic per-GPU acquire-disable config option.
+- Related remote-cache structural pyunit still passes.
+- The peer-invalidate structural pyunit was updated to use the generic option
+  and still passes.
+- `git diff --check` passes.
+
+Single next diagnostic step: implement the separate-dispatch reader functional
+smoke in `hsa_remote_cache_read` with compact summary output, then run it in
+four user-owned Timing simulations:
+
+1. forward default acquire enabled;
+2. reverse default acquire enabled;
+3. forward with target GPU1 launch acquire disabled via
+   `--disable-gpu-kernel-launch-acquire 1`;
+4. reverse with target GPU0 launch acquire disabled via
+   `--disable-gpu-kernel-launch-acquire 0`.
+
+## 2026-06-30 separate-dispatch remote-cache smoke implementation
+
+The user accepted the next diagnostic step. Codex implemented the
+separate-dispatch reader mode in the existing direct HSA remote-cache smoke.
+No long gem5 simulation was started.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' docs/debug/se-multigpu-status.md
+git status --short
+git diff -- configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py tests/pyunit/stdlib/test_se_viper_multigpu.py tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hip docs/debug/se-multigpu-status.md
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_peer_invalidate_diagnostic_has_host_sequenced_phases test_se_viper_multigpu.SEViperMultiGPUTest.test_xgmi_multigpu_config_can_disable_launch_acquire_per_gpu test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+git diff --check
+strings tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read | rg "SEPARATE_DISPATCH|shader-separate-dispatch|remote_cache_snapshot_reader"
+```
+
+First relevant observable result:
+
+- RED: after extending the structural pyunit first, the focused test failed
+  with `AssertionError: 'shader-separate-dispatch' not found in ...`.
+- GREEN: after implementing the new mode, the focused pyunit passed:
+  `Ran 1 test in 0.001s OK`.
+- The rebuilt `hsa_remote_cache_read` completed successfully and rebuilt
+  `remote_cache_kernels.hsaco`.
+- The related structural pyunit group passed:
+  `Ran 3 tests in 0.001s OK`.
+- `git diff --check` produced no output.
+- `strings` on the rebuilt binary found:
+  - `shader-separate-dispatch`;
+  - `reverse-shader-separate-dispatch`;
+  - `remote_cache_snapshot_reader`;
+  - the forward and reverse `SEPARATE_DISPATCH` result markers.
+
+Facts confirmed:
+
+- `remote_cache_kernels.hip` now includes `remote_cache_snapshot_reader`,
+  which copies a bounded vector snapshot from the target buffer to a volatile
+  output buffer and then executes `__threadfence_system()`.
+- `hsa_remote_cache_read` now accepts:
+  - `--mode shader-separate-dispatch`;
+  - `--mode reverse-shader-separate-dispatch`.
+- The new host path uses two separate reader kernel dispatches around one
+  shader writer dispatch:
+  1. reader dispatch 1 snapshots initial values into `first_values`;
+  2. remote writer dispatch writes `ValueB + i` into the target buffer;
+  3. reader dispatch 2 snapshots post-write values into `second_values`.
+- The output is compact summary only:
+  - `REMOTE_CACHE_READ_SHADER_SEPARATE_DISPATCH_RESULT count=... first_ok=... second_updated=... stale=... unexpected=... classification=...`;
+  - `REMOTE_CACHE_READ_REVERSE_SHADER_SEPARATE_DISPATCH_RESULT ...`.
+- Final result markers classify the run as updated, stale, or unexpected for
+  both directions.
+- The new mode uses the existing per-GPU launch-acquire config control for
+  interpretation; default runs still include kernel-boundary acquire.
+
+Hypotheses accepted or rejected:
+
+- Accepted: a separate-dispatch reader can now be run as a synchronized
+  functional smoke.
+- Accepted: with default launch acquire enabled, an updated result is not by
+  itself proof of pure multi-GPU cache coherence, because the second reader
+  launch may invalidate TCP.
+- Accepted: acquire-disabled variants are needed to use this mode as a
+  cache-persistence diagnostic.
+- Not yet tested: forward/reverse runtime behavior under Timing with default
+  acquire enabled or acquire disabled.
+
+Files changed:
+
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hip`
+- this status document.
+
+Verification completed:
+
+- TDD RED/GREEN for the new mode's structural coverage.
+- Rebuilt the direct HSA remote-cache smoke and its HSACO.
+- Related structural pyunit group still passes.
+- `git diff --check` passes.
+- Binary string inspection confirms the new mode and result markers are present.
+
+Single next diagnostic step: user-owned Timing simulation of the four
+separate-dispatch cases:
+
+1. forward default acquire enabled with
+   `--opts=--mode shader-separate-dispatch`;
+2. reverse default acquire enabled with
+   `--opts=--mode reverse-shader-separate-dispatch`;
+3. forward acquire-disabled diagnostic with
+   `--opts=--mode shader-separate-dispatch` plus
+   `--disable-gpu-kernel-launch-acquire 1`;
+4. reverse acquire-disabled diagnostic with
+   `--opts=--mode reverse-shader-separate-dispatch` plus
+   `--disable-gpu-kernel-launch-acquire 0`.
+
+## 2026-06-30 separate-dispatch forward default-acquire run
+
+The user ran the forward separate-dispatch reader smoke with default kernel
+launch acquire enabled and reported that it passed. Codex inspected the output
+directory to record the exact marker and command.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-shader-separate-dispatch -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode shader-separate-dispatch' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read-shader-separate-dispatch/simout.txt`
+- `m5out-hsa-remote-cache-read-shader-separate-dispatch/simerr.txt`
+
+First relevant observable result:
+
+```text
+REMOTE_CACHE_READ_SHADER_SEPARATE_DISPATCH_RESULT count=1024 first_ok=1024 second_updated=1024 stale=0 unexpected=0 classification=1
+REMOTE_CACHE_READ_SHADER_SEPARATE_DISPATCH_PASSED_UPDATED
+Exiting @ tick 28530131976 because exiting with last active thread context.
+```
+
+Facts confirmed:
+
+- The forward separate-dispatch smoke completed normally under Timing CPU.
+- Reader dispatch 1, GPU0 writer dispatch, and reader dispatch 2 all completed.
+- GPU1 observed all 1024 updated dwords after GPU0's shader writer dispatch.
+- No panic or fatal marker was found in stdout/stderr for this run.
+- This run used default launch acquire; therefore the updated result confirms
+  synchronized functional visibility, but does not by itself prove the remote
+  write invalidated an already-stale GPU1 TCP line without kernel-boundary
+  acquire.
+
+Hypotheses accepted or rejected:
+
+- Accepted: forward separate-dispatch with default acquire enabled is
+  functionally passing.
+- Rejected for this run: stale data, unexpected data, timeout, panic, or fatal
+  in the default-acquire forward separate-dispatch path.
+- Not yet proven: cache-persistence behavior with GPU1 launch acquire disabled.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout/stderr.
+- Confirmed exact result marker and exit tick.
+
+Single next diagnostic step: run the forward acquire-disabled diagnostic using
+the same mode and add `--disable-gpu-kernel-launch-acquire 1`. This tests the
+target GPU1 second reader dispatch without its default launch-acquire TCP
+invalidation.
+
+## 2026-06-30 forward acquire-disabled run stalls before smoke kernel
+
+The user started the forward separate-dispatch run with GPU1 launch acquire
+disabled using the same output directory as the previous default-acquire run
+and reported that it appeared stuck. Codex inspected the overwritten output
+directory.
+
+Command recorded from `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-shader-separate-dispatch -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode shader-separate-dispatch' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1 --disable-gpu-kernel-launch-acquire 1
+```
+
+Log files inspected:
+
+- `m5out-hsa-remote-cache-read-shader-separate-dispatch/simout.txt`
+- `m5out-hsa-remote-cache-read-shader-separate-dispatch/simerr.txt`
+- `m5out-hsa-remote-cache-read-shader-separate-dispatch/remote-cache.trace`
+
+First relevant observable result:
+
+- `ps -C gem5.opt -o pid,etime,time,pcpu,stat,args` showed no running
+  `gem5.opt` process at inspection time.
+- stdout reached:
+  `hsa_executable_load_agent_code_object writer: HSA_STATUS_SUCCESS`.
+- stdout did not reach:
+  - `hsa_executable_freeze`;
+  - `kernel remote_cache_snapshot_reader`;
+  - `ring reader`;
+  - `REMOTE_CACHE_READ_SHADER_SEPARATE_DISPATCH_RESULT`.
+- stderr ended in ROCr/syscall activity and did not contain a gem5
+  `panic`, `fatal`, or normal `Exiting` marker.
+- The trace shows internal runtime compute queue activity before the smoke
+  kernel:
+  - GPU1 queue 1 first kernel packet completed at tick `23068841139`;
+  - GPU0 queue 2 first kernel packet completed at tick `27346818546`;
+  - GPU1 queue 1 received another kernel packet at tick `27583866855`;
+  - the last relevant line was
+    `processPkt: submitting kernel dispatch pkt` at tick `27588300489`,
+    with no subsequent `finishPkt` for that packet in the captured trace.
+
+Facts confirmed:
+
+- The run did use `--disable-gpu-kernel-launch-acquire 1`.
+- The run did not reach the user smoke's `remote_cache_snapshot_reader`
+  dispatch, so it produced no updated/stale/unexpected classification.
+- The failure/stall point is earlier than the diagnostic workload: it occurs
+  during ROCr/runtime internal GPU1 compute dispatch activity around executable
+  setup/freeze.
+- Reusing the previous output directory overwrote the successful
+  default-acquire logs.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the current coarse per-GPU launch-acquire disable perturbs all GPU1
+  dispatches, including ROCr/runtime internal kernels before the smoke starts.
+- Accepted: this run cannot be interpreted as evidence of stale cache behavior
+  in the remote-write-after-cache-read test.
+- Rejected: the observed stall is caused by the new separate-dispatch snapshot
+  reader or the GPU0 remote writer; neither was reached.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Checked active gem5 process state.
+- Inspected stdout, stderr, trace tail, key marker search, and output file
+  mtimes.
+
+Single next diagnostic step: do not rerun the same coarse acquire-disabled
+command as the primary diagnostic. Add a more targeted acquire-control
+mechanism that leaves ROCr/runtime setup dispatches unchanged and disables
+launch acquire only for the specific second reader/user-kernel phase, or use a
+new unique output directory if another coarse-control experiment is needed only
+to reproduce this setup stall.
+
+## 2026-06-30 forward acquire-disabled stats after user interrupt
+
+The user interrupted the coarse forward acquire-disabled run and noted that
+`stats.txt` now had content. Codex inspected the updated stats, stdout, stderr,
+and trace.
+
+Commands run by Codex:
+
+```bash
+tail -80 docs/debug/se-multigpu-status.md
+git status --short
+stat m5out-hsa-remote-cache-read-shader-separate-dispatch/stats.txt m5out-hsa-remote-cache-read-shader-separate-dispatch/simout.txt m5out-hsa-remote-cache-read-shader-separate-dispatch/simerr.txt m5out-hsa-remote-cache-read-shader-separate-dispatch/remote-cache.trace
+tail -120 m5out-hsa-remote-cache-read-shader-separate-dispatch/simout.txt
+tail -120 m5out-hsa-remote-cache-read-shader-separate-dispatch/simerr.txt
+rg -n "board\\.gpus1.*(num|Num|total|Total|inst|Inst|instr|Instr|wave|Wave|wf|WF|dispatch|Dispatch|kernel|Kernel|complete|Complete|active|Active|busy|Busy|idle|Idle|stall|Stall|wait|Wait|exec|Exec|issue|Issue|retire|Retire)" m5out-hsa-remote-cache-read-shader-separate-dispatch/stats.txt
+rg -n "board\\.gpus0.*(numKernelLaunched|cyclesWaitingForDispatch|loadLatencyDist::samples|storeLatencyDist::samples|initToCoalesceLatency::samples|rubyNetworkLatency::samples|gmEnqueueLatency::samples|gmToCompleteLatency::samples|coalsrLineAddresses::samples)" m5out-hsa-remote-cache-read-shader-separate-dispatch/stats.txt
+rg -n "MachineType\\.(L1Cache|L2Cache|L3Cache).*incomplete|m_outstandReqHistSeqr|incomplete_times_seqr|RequestType\\.(LD|ST|IFETCH|RMW).*total" m5out-hsa-remote-cache-read-shader-separate-dispatch/stats.txt
+```
+
+First relevant observable result:
+
+```text
+Exiting @ tick 82079832339 because user interrupt received.
+```
+
+Key stats:
+
+```text
+simTicks                                  82079832339
+simInsts                                    119452149
+board.gpus0.dispatcher.numKernelLaunched            0
+board.gpus1.dispatcher.numKernelLaunched            1
+board.gpus1.dispatcher.cyclesWaitingForDispatch            1
+board.gpus1.loadLatencyDist::samples                0
+board.gpus1.storeLatencyDist::samples               0
+board.gpus1.initToCoalesceLatency::samples          0
+board.gpus1.rubyNetworkLatency::samples             0
+board.gpus1.gmEnqueueLatency::samples               0
+board.gpus1.gmToCompleteLatency::samples            0
+board.cache_hierarchy.ruby_system.m_outstandReqHistSeqr::samples    118395334
+board.cache_hierarchy.ruby_system.MachineType.L1Cache.incomplete_times_seqr    118305777
+```
+
+Facts confirmed:
+
+- The run advanced from the earlier trace tail at about 27.58B ticks to
+  82.08B ticks before user interrupt.
+- `remote-cache.trace` did not grow after the internal GPU1 kernel dispatch;
+  no user-smoke `ring reader` marker appeared.
+- GPU1 launched exactly one kernel before the interrupt, but GPU1 reported no
+  load/store/coalescer/ruby-network samples. That kernel therefore did not
+  progress into visible vector memory traffic.
+- GPU0 launched no kernels in the interrupted run.
+- Ruby sequencer incomplete/outstanding request samples are roughly the same
+  order as CPU simulated instructions, consistent with CPU-side runtime
+  polling/waiting after the internal GPU1 dispatch rather than progress through
+  the remote-cache smoke body.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the coarse `--disable-gpu-kernel-launch-acquire 1` run stalls
+  before the smoke's snapshot reader and writer are reached.
+- Accepted: the stall is associated with a ROCr/runtime internal GPU1 kernel
+  dispatch before `hsa_executable_freeze` completes.
+- Accepted: stats strengthen the interpretation that the long tail after the
+  trace stops is CPU-side waiting/polling, not active progress through the
+  remote-cache diagnostic.
+- Rejected: the stats show an in-progress user remote-cache reader or GPU0
+  remote writer; neither appears in stdout/trace/stats.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stats, stdout, stderr, trace timestamps, and selected
+  GPU/Ruby counters.
+
+Single next diagnostic step: implement targeted launch-acquire suppression
+instead of per-GPU coarse suppression. The control must avoid ROCr/runtime
+setup kernels and apply only to the intended user dispatch phase, preferably
+the second `remote_cache_snapshot_reader` dispatch in
+`shader-separate-dispatch`.
+
+## 2026-06-30 targeted second-reader launch-acquire control implementation
+
+The user accepted the targeted-control approach. Codex implemented a one-shot
+host marker mechanism so ROCr/runtime setup dispatches keep their default
+launch acquire, while the remote-cache smoke can request skipping launch
+acquire for only the next dispatch on the target GPU.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/test-driven-development/SKILL.md
+sed -n '1,120p' AGENTS.md
+tail -180 docs/debug/se-multigpu-status.md
+git status --short
+git diff -- configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py src/gpu-compute src/dev/hsa tests/pyunit/stdlib/test_se_viper_multigpu.py tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp tests/test-progs/gpu/xgmi-peer-vram/remote_cache_kernels.hip docs/debug/se-multigpu-status.md
+rg -n "impl_kern_launch_acq|prepareInvalidate|launch_acq|launch acquire|m5_work|work_begin|m5op|pseudo|Pseudo|workbegin|work_begin|m5_exit|m5_reset|m5" src/gpu-compute src/sim src/arch/x86 configs tests/test-progs/gpu/xgmi-peer-vram -S
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_cache_read ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_peer_invalidate_diagnostic_has_host_sequenced_phases test_se_viper_multigpu.SEViperMultiGPUTest.test_xgmi_multigpu_config_can_disable_launch_acquire_per_gpu test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+git diff --check
+strings tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read | rg "disable-second-reader-launch-acquire|gem5-disable-next-gpu-launch-acquire|requested next launch acquire skip"
+```
+
+First relevant observable result:
+
+- RED: after extending the structural pyunit first, the focused test failed
+  with:
+  `AssertionError: '--disable-second-reader-launch-acquire' not found`.
+- GREEN: after implementation, the focused test passed:
+  `Ran 1 test in 0.001s OK`.
+- Rebuilding `hsa_remote_cache_read` completed successfully.
+- The related structural pyunit group passed:
+  `Ran 3 tests in 0.002s OK`.
+- `git diff --check` produced no output.
+- `strings hsa_remote_cache_read` confirmed the new app option and marker path
+  are present.
+
+Facts confirmed:
+
+- `hsa_remote_cache_read` now accepts:
+  `--disable-second-reader-launch-acquire`.
+- The new option is valid only with:
+  - `--mode shader-separate-dispatch`; or
+  - `--mode reverse-shader-separate-dispatch`.
+- At startup, the smoke removes stale marker files for all discovered GPUs:
+  `/tmp/gem5-disable-next-gpu-launch-acquire-gpuN`.
+- If the new option is enabled, the smoke creates the target GPU marker
+  immediately before the second `remote_cache_snapshot_reader` dispatch.
+- Forward mode targets GPU1, so it writes:
+  `/tmp/gem5-disable-next-gpu-launch-acquire-gpu1`.
+- Reverse mode targets GPU0, so it writes:
+  `/tmp/gem5-disable-next-gpu-launch-acquire-gpu0`.
+- `GPUDispatcher::exec()` now checks for the marker only when
+  `shader->impl_kern_launch_acq` is otherwise true. If present, it removes the
+  marker, prints `Targeted launch acquire skip`, marks the invalidate complete
+  for that dispatch, and leaves later dispatches unchanged.
+- The older coarse per-GPU config option remains present, but should not be
+  used for this ROCr-sensitive diagnostic.
+
+Hypotheses accepted or rejected:
+
+- Accepted: targeted one-shot suppression can avoid perturbing ROCr/runtime
+  setup kernels while still disabling launch acquire for the intended user
+  dispatch.
+- Accepted: the implementation is diagnostic-only and marker-file based to
+  keep the change small; it is not a general ROCm API.
+- Not yet verified: `src/gpu-compute/dispatcher.cc` compilation, because that
+  requires a gem5 rebuild owned by the user.
+- Not yet verified: runtime behavior of the targeted forward or reverse
+  acquire-disabled run.
+
+Files changed:
+
+- `src/gpu-compute/dispatcher.cc`
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- TDD RED/GREEN structural pyunit for the targeted-control interface.
+- Rebuilt `hsa_remote_cache_read`.
+- Related structural pyunit group still passes.
+- `git diff --check` passes.
+- Binary string inspection confirms the new app option and marker string.
+
+Single next diagnostic step: user rebuilds gem5, then runs forward targeted
+acquire-disabled using default GPU launch acquire config plus the app option:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp --debug-file=remote-cache.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read '--opts=--mode shader-separate-dispatch --disable-second-reader-launch-acquire' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Expected trace evidence:
+
+- normal ROCr setup reaches `hsa_executable_freeze`;
+- first reader dispatch completes normally;
+- stdout prints `requested next launch acquire skip for GPU1`;
+- trace contains `Targeted launch acquire skip for GPU1`;
+- the run reaches
+  `REMOTE_CACHE_READ_SHADER_SEPARATE_DISPATCH_RESULT`.
+
+## 2026-06-30 targeted noacq forward run trace inspection
+
+The user ran the forward targeted acquire-disabled command and asked Codex to
+inspect:
+
+`m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq`
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' AGENTS.md
+tail -180 docs/debug/se-multigpu-status.md
+git status --short
+stat m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simout.txt m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simerr.txt m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/remote-cache.trace m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/stats.txt
+tail -160 m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simout.txt
+tail -120 m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simerr.txt
+rg -n "Targeted launch acquire skip|requested next launch acquire|ring reader queue|wait shader separate-dispatch|REMOTE_CACHE_READ_SHADER_SEPARATE|prepareInvalidate|markInvDone|processPkt: submitting kernel dispatch pkt|Kernel dispatch|GPU Blit Kernel Completed" m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/remote-cache.trace m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simout.txt
+rg -n "numKernelLaunched|loadLatencyDist::samples|storeLatencyDist::samples|gmToCompleteLatency::samples|rubyNetworkLatency::samples|RequestType\\.(LD|ST).*total|MachineType\\.(L1Cache|L2Cache|L3Cache).*incomplete" m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/stats.txt
+ls -l /tmp/gem5-disable-next-gpu-launch-acquire-gpu*
+rg -n "Targeted|launch acquire|Launch acquire|skip|marker|Invalidate|prepare|markInv|GPUDispatcher|GPUDisp|exec" m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/remote-cache.trace
+sed -n '33680,43380p' m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/remote-cache.trace
+rg -n "Targeted launch acquire skip|disableNextLaunchAcquire|consumeNextLaunchAcquire|DisableNextLaunchAcquire|DPRINTF\\(GPUDisp|markInvDone|prepareInvalidate" src/gpu-compute/dispatcher.cc src/gpu-compute/dispatcher.hh src/gpu-compute/shader.cc src/gpu-compute/shader.hh
+sed -n '1,155p' tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp
+sed -n '48,88p' src/gpu-compute/dispatcher.cc
+```
+
+First relevant observable result:
+
+```text
+REMOTE_CACHE_READ_SHADER_SEPARATE_DISPATCH_RESULT count=1024 first_ok=1024 second_updated=1024 stale=0 unexpected=0 classification=1
+REMOTE_CACHE_READ_SHADER_SEPARATE_DISPATCH_PASSED_UPDATED
+Exiting @ tick 28539091674 because exiting with last active thread context.
+```
+
+The expected targeted skip marker was not found in trace:
+
+```text
+no match for "Targeted launch acquire skip"
+```
+
+The second GPU1 reader still showed launch-acquire invalidate behavior:
+
+```text
+28045650610: board.gpus1.dispatcher: kernel 2 failed to launch, due to [4] pending invalidate requests
+28045650943: board.gpus1.dispatcher: kernel 2 failed to launch, due to [4] pending invalidate requests
+```
+
+Facts confirmed:
+
+- The run completed normally and did not reproduce the coarse noacq runtime
+  setup stall.
+- The application created the one-shot marker before the second GPU1 reader:
+  `/tmp/gem5-disable-next-gpu-launch-acquire-gpu1`.
+- The smoke reported all entries updated:
+  `first_ok=1024 second_updated=1024 stale=0 unexpected=0`.
+- The trace did not contain the dispatcher-side
+  `Targeted launch acquire skip` message.
+- The second GPU1 reader still waited for pending invalidate requests, so the
+  targeted noacq control did not actually suppress launch acquire in this run.
+- Source inspection found the likely cause: `shaderGpuIndex()` parses names
+  like `board.gpus1` with an offset of `+4`, leaving the cursor on the `s`
+  character instead of the digit. It therefore returns `-1` and never checks
+  `/tmp/gem5-disable-next-gpu-launch-acquire-gpu1`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: this run is a valid forward separate-dispatch PASS under the
+  normal launch-acquire path.
+- Rejected: this run proves second-reader launch acquire was disabled. It did
+  not; the marker was not consumed by `GPUDispatcher`.
+- Accepted: the targeted mechanism has an implementation bug in GPU index
+  parsing, not an observed coherence failure.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, stats, `/tmp` marker state,
+  and the marker parsing implementation.
+
+Single next diagnostic step: fix `shaderGpuIndex()` so `board.gpusN` resolves
+to `N`, rebuild gem5, and rerun the same forward targeted command. The expected
+trace must include `Targeted launch acquire skip for GPU1`; only then can the
+result be interpreted as a real second-reader launch-acquire-disabled result.
+
+## 2026-06-30 targeted noacq marker path fix
+
+The user accepted the next-step recommendation and asked Codex to execute the
+fix. Codex did not start a gem5 rebuild or long simulation.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,240p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/test-driven-development/SKILL.md
+sed -n '1,240p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/systematic-debugging/SKILL.md
+git diff -- src/gpu-compute/dispatcher.cc tests/pyunit/stdlib/test_se_viper_multigpu.py docs/debug/se-multigpu-status.md
+rg -n "cleanup_disable_next_launch_acquire_markers|request_disable_next_launch_acquire|disable_second_reader_launch_acquire" tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_cache_read.cpp
+strings build/VEGA_X86/gem5.opt | rg "Targeted launch acquire skip|gem5-disable-next-gpu-launch-acquire|disable-next-gpu-launch"
+rg -n "checkPathRedirect|redirect|absolute|/tmp|openat|openFunc|open\\(" src/sim src/arch src/base -S
+find /home/zhangds/gem5 /tmp -maxdepth 5 -name 'gem5-disable-next-gpu-launch-acquire-gpu*' -print
+sed -n '470,510p' src/sim/process.cc
+sed -n '550,590p' src/sim/process.cc
+sed -n '900,950p' src/sim/syscall_emul.hh
+rg -n "simout|OutputDirectory|outdir|resolve\\(" src -S | head -120
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+git diff --check
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_peer_invalidate_diagnostic_has_host_sequenced_phases test_se_viper_multigpu.SEViperMultiGPUTest.test_xgmi_multigpu_config_can_disable_launch_acquire_per_gpu test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_write_after_cache_read_smoke_has_same_dispatch_reader
+```
+
+First relevant observable result:
+
+- The old run left the marker at:
+  `m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/fs/tmp/gem5-disable-next-gpu-launch-acquire-gpu1`
+- It did not leave the marker in host `/tmp`.
+- RED: after adding structural coverage for `simout.resolve("fs/tmp/...")`,
+  the focused pyunit failed with:
+  `AssertionError: '#include "base/output.hh"' not found`.
+- GREEN: after the fix, the focused pyunit passed:
+  `Ran 1 test in 0.001s OK`.
+- The related structural pyunit group passed:
+  `Ran 3 tests in 0.002s OK`.
+- `git diff --check` produced no output.
+
+Facts confirmed:
+
+- The earlier hypothesis that `shaderGpuIndex()` had an off-by-one bug was
+  wrong for names like `board.gpus1`; the current parser lands on digit `1`.
+- The actual root cause is SE filesystem redirection. The simulated app's
+  `/tmp/gem5-disable-next-gpu-launch-acquire-gpu1` is redirected to
+  `<outdir>/fs/tmp/gem5-disable-next-gpu-launch-acquire-gpu1`.
+- `GPUDispatcher` was checking only the host `/tmp/...` path, so it could not
+  see the guest-created marker.
+- `build/VEGA_X86/gem5.opt` already contained the targeted-skip string, so the
+  missing trace line in the previous run was not due to an unrebuilt binary.
+- `GPUDispatcher` now checks both:
+  - host `/tmp/gem5-disable-next-gpu-launch-acquire-gpuN`; and
+  - `simout.resolve("fs/tmp/gem5-disable-next-gpu-launch-acquire-gpuN")`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: targeted noacq failed because of marker path visibility under SE
+  filesystem redirection.
+- Rejected: the immediate bug was GPU index parsing for `board.gpusN`.
+- Accepted: keeping the host `/tmp` fallback is useful for non-redirected or
+  future direct-host marker use.
+
+Files changed:
+
+- `src/gpu-compute/dispatcher.cc`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- TDD RED/GREEN structural pyunit.
+- Related structural pyunit group.
+- `git diff --check`.
+- No gem5 rebuild or full simulation was started by Codex.
+
+Single next diagnostic step: user rebuilds gem5 and reruns the same forward
+targeted command. The expected evidence is:
+
+- stdout still prints `requested next launch acquire skip for GPU1`;
+- trace contains
+  `Targeted launch acquire skip for GPU1 marker .../fs/tmp/gem5-disable-next-gpu-launch-acquire-gpu1`;
+- second GPU1 reader does not show `pending invalidate requests` for that
+  dispatch;
+- the run reaches
+  `REMOTE_CACHE_READ_SHADER_SEPARATE_DISPATCH_RESULT`.
+
+## 2026-06-30 targeted noacq forward rerun after marker-path fix
+
+The user rebuilt gem5 and reran the forward targeted noacq command, then asked
+Codex to inspect:
+
+`m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq`
+
+Commands run by Codex:
+
+```bash
+sed -n '1,240p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/systematic-debugging/SKILL.md
+tail -220 docs/debug/se-multigpu-status.md
+git status --short
+stat m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simout.txt m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simerr.txt m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/remote-cache.trace m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/stats.txt
+tail -180 m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simout.txt
+tail -140 m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simerr.txt
+rg -n "Targeted launch acquire skip|requested next launch acquire|ring reader queue|wait shader separate-dispatch|REMOTE_CACHE_READ_SHADER_SEPARATE|processPkt: submitting kernel dispatch pkt|kernel 2 failed to launch|pending invalidate requests|launching kernel|HSA AQL Kernel Complete" m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/remote-cache.trace m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simout.txt
+find m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/fs/tmp -maxdepth 1 -name 'gem5-disable-next-gpu-launch-acquire-gpu*' -print -ls
+rg -n "numKernelLaunched|loadLatencyDist::samples|storeLatencyDist::samples|gmToCompleteLatency::samples|rubyNetworkLatency::samples|RequestType\\.(LD|ST).*total|MachineType\\.(L1Cache|L2Cache|L3Cache).*incomplete" m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/stats.txt
+sed -n '43860,43930p' m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/remote-cache.trace
+rg -n "board\\.gpus1\\.dispatcher: kernel 2 failed|board\\.gpus1\\.dispatcher: Launching 1 Kernels|board\\.gpus1\\.dispatcher: Returning|board\\.gpus1\\.dispatcher: HSA AQL Kernel Complete|Targeted launch acquire skip" m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/remote-cache.trace
+rg -n "panic|fatal|assert|Invalid transition|Page fault|FAILED|OBSERVED_STALE|FAILED_UNEXPECTED|PASSED_UPDATED|RESULT" m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simout.txt m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simerr.txt
+```
+
+First relevant observable result:
+
+```text
+gem5 compiled Jun 30 2026 17:12:20
+[hsa_remote_cache_read] requested next launch acquire skip for GPU1 marker=/tmp/gem5-disable-next-gpu-launch-acquire-gpu1
+REMOTE_CACHE_READ_SHADER_SEPARATE_DISPATCH_RESULT count=1024 first_ok=1024 second_updated=1024 stale=0 unexpected=0 classification=1
+REMOTE_CACHE_READ_SHADER_SEPARATE_DISPATCH_PASSED_UPDATED
+Exiting @ tick 28551313440 because exiting with last active thread context.
+```
+
+Key trace evidence:
+
+```text
+28059269977: global: Targeted launch acquire skip for GPU1 marker m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/fs/tmp/gem5-disable-next-gpu-launch-acquire-gpu1
+28059269977: board.gpus1: Dispatching a workgroup to CU 0: WG 0
+```
+
+Facts confirmed:
+
+- The rerun used the rebuilt gem5 binary containing the marker-path fix.
+- The application created the guest `/tmp` marker before second GPU1 reader.
+- `GPUDispatcher` consumed the redirected marker from
+  `<outdir>/fs/tmp/gem5-disable-next-gpu-launch-acquire-gpu1`.
+- The marker file was removed; `find .../fs/tmp` found no remaining marker.
+- For the second GPU1 reader dispatch ID 2, trace contains the targeted skip
+  and immediate workgroup dispatch.
+- No `board.gpus1.dispatcher: kernel 2 failed ... pending invalidate requests`
+  line appears after the targeted skip.
+- The test completed with:
+  `first_ok=1024 second_updated=1024 stale=0 unexpected=0`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the targeted one-shot marker mechanism now works under SE path
+  redirection.
+- Accepted: forward separate-dispatch reader sees all updated values even when
+  the second reader's launch acquire is explicitly skipped.
+- Rejected: the previous PASS was sufficient evidence for targeted noacq; only
+  this rerun has the required dispatcher-side skip evidence.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, stats, and marker-file state.
+- Confirmed no panic/fatal/page-fault/invalid-transition in stdout/stderr.
+
+Single next diagnostic step: run the symmetric reverse targeted noacq case
+using `--mode reverse-shader-separate-dispatch --disable-second-reader-launch-acquire`.
+Expected trace evidence is the same, but with
+`Targeted launch acquire skip for GPU0` and the reverse result marker.
+
+## 2026-06-30 targeted noacq reverse rerun
+
+The user reran into the same directory with the reverse targeted noacq mode and
+asked Codex to inspect:
+
+`m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq`
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/systematic-debugging/SKILL.md
+tail -180 docs/debug/se-multigpu-status.md
+git status --short
+stat m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simout.txt m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simerr.txt m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/remote-cache.trace m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/stats.txt
+sed -n '1,90p' m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simout.txt
+tail -120 m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simerr.txt
+rg -n "Targeted launch acquire skip|requested next launch acquire|REMOTE_CACHE_READ_REVERSE_SHADER_SEPARATE|processPkt: submitting kernel dispatch pkt|kernel 2 failed to launch|pending invalidate requests|launching kernel|HSA AQL Kernel Complete|Dispatching a workgroup" m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/remote-cache.trace m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simout.txt
+find m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/fs/tmp -maxdepth 1 -name 'gem5-disable-next-gpu-launch-acquire-gpu*' -print -ls
+rg -n "panic|fatal|assert|Invalid transition|Page fault|FAILED|OBSERVED_STALE|FAILED_UNEXPECTED|PASSED_UPDATED|RESULT" m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simout.txt m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/simerr.txt
+```
+
+First relevant observable result:
+
+```text
+command line: ... '--opts=--mode reverse-shader-separate-dispatch --disable-second-reader-launch-acquire' ...
+[hsa_remote_cache_read] requested next launch acquire skip for GPU0 marker=/tmp/gem5-disable-next-gpu-launch-acquire-gpu0
+REMOTE_CACHE_READ_REVERSE_SHADER_SEPARATE_DISPATCH_RESULT count=1024 first_ok=1024 second_updated=1024 stale=0 unexpected=0 classification=1
+REMOTE_CACHE_READ_REVERSE_SHADER_SEPARATE_DISPATCH_PASSED_UPDATED
+Exiting @ tick 28564470270 because exiting with last active thread context.
+```
+
+Key trace evidence:
+
+```text
+28072040860: global: Targeted launch acquire skip for GPU0 marker m5out-hsa-remote-cache-read-shader-separate-dispatch-targeted-noacq/fs/tmp/gem5-disable-next-gpu-launch-acquire-gpu0
+28072040860: board.gpus0: Dispatching a workgroup to CU 0: WG 0
+```
+
+Facts confirmed:
+
+- The directory now contains the reverse targeted noacq run, not the previous
+  forward run.
+- The reverse path used GPU0 as the second reader and GPU1 as the writer.
+- `GPUDispatcher` consumed the redirected GPU0 marker from
+  `<outdir>/fs/tmp/gem5-disable-next-gpu-launch-acquire-gpu0`.
+- The marker file was removed; `find .../fs/tmp` found no remaining marker.
+- For the second GPU0 reader dispatch ID 2, trace contains the targeted skip
+  and immediate workgroup dispatch.
+- No `kernel 2 failed ... pending invalidate requests` appears for this second
+  reader dispatch.
+- The test completed with:
+  `first_ok=1024 second_updated=1024 stale=0 unexpected=0`.
+- No panic/fatal/page-fault/invalid-transition was found in stdout/stderr.
+
+Hypotheses accepted or rejected:
+
+- Accepted: targeted one-shot launch-acquire suppression works symmetrically
+  for reverse GPU1-to-GPU0 separate-dispatch reader.
+- Accepted: reverse separate-dispatch reader sees all updated values even when
+  the second reader's launch acquire is explicitly skipped.
+- This confirms both forward and reverse directions for the current
+  separate-dispatch shader-store litmus.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and marker-file state.
+
+Single next diagnostic step: decide whether to commit the current functional
+diagnostic state, or add one more same-dispatch/resident-reader litmus if the
+goal is to remove kernel-boundary effects even further.

@@ -759,11 +759,11 @@ class SEViperMultiGPUTest(unittest.TestCase):
         self.assertIn("--offload-arch=gfx900", makefile)
 
         self.assertIn(
-            "--disable-gpu0-kernel-launch-acquire",
+            "--disable-gpu-kernel-launch-acquire",
             config,
         )
         self.assertIn(
-            "gpus[0].impl_kern_launch_acq = False",
+            "gpus[gpu_index].impl_kern_launch_acq = False",
             config,
         )
         self.assertIn(
@@ -884,6 +884,207 @@ class SEViperMultiGPUTest(unittest.TestCase):
         self.assertIn("HSA_SDMA_PEER_ASYNC_COPY_PASSED", source)
         self.assertNotIn("hipMemcpy", source)
         self.assertNotIn("hipMemset", source)
+
+    def test_remote_write_after_cache_read_smoke_has_same_dispatch_reader(self):
+        root = Path("tests/test-progs/gpu/xgmi-peer-vram")
+        source = (root / "hsa_remote_cache_read.cpp").read_text()
+        kernels = (root / "remote_cache_kernels.hip").read_text()
+        makefile = (root / "Makefile").read_text()
+
+        self.assertIn("HSA_REMOTE_CACHE_READ_TARGET", makefile)
+        self.assertIn("hsa_remote_cache_read.cpp", makefile)
+        self.assertIn("REMOTE_CACHE_HSACO_TARGET", makefile)
+        self.assertIn("remote_cache_kernels.hip", makefile)
+        self.assertIn("$(HSA_REMOTE_CACHE_READ_TARGET)", makefile)
+
+        self.assertIn("std::vector<hsa_agent_t> gpus", source)
+        self.assertIn("gpus.size() < 2", source)
+        self.assertIn("hsa_queue_create", source)
+        self.assertIn("remote_cache_reader", source)
+        self.assertIn("hsa_amd_memory_async_copy", source)
+        self.assertIn('"GPU0_TO_GPU1_OVERWRITE"', source)
+        self.assertIn("REMOTE_CACHE_READ_PASSED_UPDATED", source)
+        self.assertIn("REMOTE_CACHE_READ_OBSERVED_STALE", source)
+        self.assertIn("REMOTE_CACHE_READ_FAILED_UNEXPECTED", source)
+        self.assertIn("--mode", source)
+        self.assertIn("REMOTE_CACHE_READ_REPEATED_ROUND", source)
+        self.assertIn("REMOTE_CACHE_READ_REPEATED_PASSED_UPDATED", source)
+        self.assertIn("REMOTE_CACHE_READ_REVERSE_RESULT", source)
+        self.assertIn("REMOTE_CACHE_READ_REVERSE_PASSED_UPDATED", source)
+        self.assertIn('"GPU1_TO_GPU0_OVERWRITE"', source)
+        self.assertIn("REMOTE_CACHE_READ_MULTI_OFFSET_RESULT", source)
+        self.assertIn("REMOTE_CACHE_READ_MULTI_OFFSET_PASSED_UPDATED", source)
+        self.assertIn('"GPU0_TO_GPU1_MULTI_OFFSET_OVERWRITE"', source)
+        self.assertIn("MultiOffsetDwords", source)
+        self.assertIn("REMOTE_CACHE_READ_MULTI_LINE_RESULT", source)
+        self.assertIn("REMOTE_CACHE_READ_MULTI_LINE_PASSED_UPDATED", source)
+        self.assertIn('"GPU0_TO_GPU1_MULTI_LINE_OVERWRITE"', source)
+        self.assertIn("MultiLineDwords", source)
+        self.assertIn("REMOTE_CACHE_READ_REVERSE_MULTI_LINE_RESULT", source)
+        self.assertIn("REMOTE_CACHE_READ_REVERSE_MULTI_LINE_PASSED_UPDATED",
+                      source)
+        self.assertIn('"GPU1_TO_GPU0_MULTI_LINE_OVERWRITE"', source)
+        self.assertIn("REMOTE_CACHE_READ_LARGE_COPY_RESULT", source)
+        self.assertIn("REMOTE_CACHE_READ_LARGE_COPY_PASSED_UPDATED", source)
+        self.assertIn('"GPU0_TO_GPU1_LARGE_COPY_OVERWRITE"', source)
+        self.assertIn("REMOTE_CACHE_READ_REVERSE_LARGE_COPY_RESULT", source)
+        self.assertIn("REMOTE_CACHE_READ_REVERSE_LARGE_COPY_PASSED_UPDATED",
+                      source)
+        self.assertIn('"GPU1_TO_GPU0_LARGE_COPY_OVERWRITE"', source)
+        self.assertIn("LargeCopyDwords", source)
+        self.assertIn("REMOTE_CACHE_READ_SHADER_STORE_RESULT", source)
+        self.assertIn("REMOTE_CACHE_READ_SHADER_STORE_PASSED_UPDATED",
+                      source)
+        self.assertIn("REMOTE_CACHE_READ_SHADER_STORE_OBSERVED_STALE",
+                      source)
+        self.assertIn('"GPU0_TO_GPU1_SHADER_STORE"', source)
+        self.assertIn("REMOTE_CACHE_READ_REVERSE_SHADER_STORE_RESULT",
+                      source)
+        self.assertIn("REMOTE_CACHE_READ_REVERSE_SHADER_STORE_PASSED_UPDATED",
+                      source)
+        self.assertIn('"GPU1_TO_GPU0_SHADER_STORE"', source)
+        self.assertIn("REMOTE_CACHE_READ_SHADER_MULTI_LINE_RESULT", source)
+        self.assertIn("REMOTE_CACHE_READ_SHADER_MULTI_LINE_PASSED_UPDATED",
+                      source)
+        self.assertIn('"GPU0_TO_GPU1_SHADER_MULTI_LINE_STORE"', source)
+        self.assertIn(
+            "REMOTE_CACHE_READ_REVERSE_SHADER_MULTI_LINE_RESULT", source)
+        self.assertIn(
+            "REMOTE_CACHE_READ_REVERSE_SHADER_MULTI_LINE_PASSED_UPDATED",
+            source)
+        self.assertIn('"GPU1_TO_GPU0_SHADER_MULTI_LINE_STORE"', source)
+        self.assertIn("REMOTE_CACHE_READ_SHADER_LARGE_RESULT", source)
+        self.assertIn("REMOTE_CACHE_READ_SHADER_LARGE_PASSED_UPDATED",
+                      source)
+        self.assertIn('"GPU0_TO_GPU1_SHADER_LARGE_STORE"', source)
+        self.assertIn("REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_RESULT",
+                      source)
+        self.assertIn("REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_PASSED_UPDATED",
+                      source)
+        self.assertIn('"GPU1_TO_GPU0_SHADER_LARGE_STORE"', source)
+        self.assertIn("shader-large-repeated", source)
+        self.assertIn("reverse-shader-large-repeated", source)
+        self.assertIn("REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_ROUND",
+                      source)
+        self.assertIn("REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_RESULT",
+                      source)
+        self.assertIn(
+            "REMOTE_CACHE_READ_SHADER_LARGE_REPEATED_PASSED_UPDATED",
+            source)
+        self.assertIn(
+            "REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_ROUND",
+            source)
+        self.assertIn(
+            "REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_RESULT",
+            source)
+        self.assertIn(
+            "REMOTE_CACHE_READ_REVERSE_SHADER_LARGE_REPEATED_PASSED_UPDATED",
+            source)
+        self.assertIn("shader-separate-dispatch", source)
+        self.assertIn("reverse-shader-separate-dispatch", source)
+        self.assertIn("ModeShaderSeparateDispatch", source)
+        self.assertIn("ModeReverseShaderSeparateDispatch", source)
+        self.assertIn("run_remote_cache_shader_separate_dispatch_round",
+                      source)
+        self.assertIn("--disable-second-reader-launch-acquire", source)
+        self.assertIn("disable_next_launch_acquire_marker_path", source)
+        self.assertIn("request_disable_next_launch_acquire", source)
+        self.assertIn("cleanup_disable_next_launch_acquire_markers", source)
+        self.assertIn("REMOTE_CACHE_READ_SHADER_SEPARATE_DISPATCH_RESULT",
+                      source)
+        self.assertIn(
+            "REMOTE_CACHE_READ_SHADER_SEPARATE_DISPATCH_PASSED_UPDATED",
+            source)
+        self.assertIn(
+            "REMOTE_CACHE_READ_REVERSE_SHADER_SEPARATE_DISPATCH_RESULT",
+            source)
+        self.assertIn(
+            "REMOTE_CACHE_READ_REVERSE_SHADER_SEPARATE_DISPATCH_PASSED_UPDATED",
+            source)
+        self.assertIn("second_updated=%u", source)
+        self.assertIn("stale=%u", source)
+        self.assertIn("unexpected=%u", source)
+        self.assertIn("reverse_shader_vector", source)
+        self.assertIn('"hsa_queue_create GPU1 writer"', source)
+        self.assertNotIn("hipMemcpy", source)
+        self.assertNotIn("hipMemset", source)
+
+        self.assertIn("RemoteCacheControl", kernels)
+        self.assertIn("extern \"C\" __global__ void remote_cache_reader",
+                      kernels)
+        self.assertIn("const uint32_t *target", kernels)
+        self.assertIn("volatile RemoteCacheControl *control", kernels)
+        self.assertIn("control->first_read_done = 1", kernels)
+        self.assertIn("while (control->allow_second_read == 0", kernels)
+        self.assertIn("const uint32_t second = target[0]", kernels)
+        self.assertIn("remote_cache_multi_offset_reader", kernels)
+        self.assertIn("remote_cache_snapshot_reader", kernels)
+        self.assertIn("volatile uint32_t *values", kernels)
+        self.assertIn("values[i] = target[i]", kernels)
+        self.assertIn("remote_cache_writer", kernels)
+        self.assertIn("remote_cache_multi_offset_writer", kernels)
+        self.assertIn("for (uint32_t i = 0; i < count; ++i)", kernels)
+        self.assertIn("first_values[i]", kernels)
+        self.assertIn("second_values[i]", kernels)
+        self.assertIn("*target = value", kernels)
+        self.assertIn("target[i] = value_base + i", kernels)
+        self.assertIn("RemoteCacheUpdated", kernels)
+        self.assertIn("RemoteCacheStale", kernels)
+
+        dispatcher = Path("src/gpu-compute/dispatcher.cc").read_text()
+        self.assertIn("gem5-disable-next-gpu-launch-acquire-gpu", dispatcher)
+        self.assertIn("#include \"base/output.hh\"", dispatcher)
+        self.assertIn("simout.resolve", dispatcher)
+        self.assertIn("\"fs/tmp/\"", dispatcher)
+        self.assertIn("consumeNextLaunchAcquireDisableMarker", dispatcher)
+        self.assertIn("Targeted launch acquire skip", dispatcher)
+        self.assertIn("std::remove(marker.c_str())", dispatcher)
+        self.assertIn("skipLaunchAcquire", dispatcher)
+
+    def test_xgmi_multigpu_config_can_disable_launch_acquire_per_gpu(self):
+        config = Path(
+            "configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py"
+        ).read_text()
+
+        self.assertIn("--disable-gpu-kernel-launch-acquire", config)
+        self.assertIn("action=\"append\"", config)
+        self.assertIn("disabled_launch_acquire_gpus", config)
+        self.assertIn("for gpu_index in disabled_launch_acquire_gpus", config)
+        self.assertIn("gpus[gpu_index].impl_kern_launch_acq = False",
+                      config)
+        self.assertIn("cache-persistence diagnostics", config)
+        self.assertNotIn("--disable-gpu0-kernel-launch-acquire", config)
+        self.assertNotIn("args.disable_gpu0_kernel_launch_acquire", config)
+
+    def test_gpu_viper_directory_completes_dma_write_when_l3hit_arrives_after_probe_acks(self):
+        directory = Path(
+            "src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm"
+        ).read_text()
+
+        self.assertIn("transition(BDW_PM, L3Hit, BDW_Pm)", directory)
+        self.assertIn("transition(BDW_PM, ProbeAcksComplete, BDW_M)",
+                      directory)
+        self.assertIn("transition(BDW_M, MemData, U)", directory)
+
+        match = re.search(
+            r"transition\(BDW_M, L3Hit, U\) \{(?P<body>.*?)\n  \}",
+            directory,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        body = match.group("body")
+        expected_actions = [
+            "wd_writeBackData;",
+            "da_sendResponseDmaAck;",
+            "wada_wakeUpAllDependentsAddr;",
+            "dt_deallocateTBE;",
+            "ptl_popTriggerQueue;",
+        ]
+        position = -1
+        for action in expected_actions:
+            next_position = body.find(action)
+            self.assertGreater(next_position, position)
+            position = next_position
 
     def test_se_viper_gpu_exposes_sdma_dma_port(self):
         se_viper_gpu = Path(

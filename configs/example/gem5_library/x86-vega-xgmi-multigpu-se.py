@@ -96,11 +96,15 @@ parser.add_argument(
     help="Disable GPU_VIPER write-back L2. WB L2 is enabled by default.",
 )
 parser.add_argument(
-    "--disable-gpu0-kernel-launch-acquire",
-    action="store_true",
+    "--disable-gpu-kernel-launch-acquire",
+    action="append",
+    default=[],
+    type=int,
+    metavar="GPU_INDEX",
     help=(
-        "Disable GPU0's implicit cache invalidation at kernel launch. "
-        "Required only for cache-persistence diagnostics."
+        "Disable one GPU's implicit cache invalidation at kernel launch. "
+        "May be specified multiple times. Required only for "
+        "cache-persistence diagnostics."
     ),
 )
 args = parser.parse_args()
@@ -109,6 +113,14 @@ if args.num_gpus < 1 or args.num_gpus & (args.num_gpus - 1):
     raise ValueError("--num-gpus must be a positive power of two")
 if args.num_cpu_cores < 1:
     raise ValueError("--num-cpu-cores must be positive")
+disabled_launch_acquire_gpus = set(args.disable_gpu_kernel_launch_acquire)
+for gpu_index in disabled_launch_acquire_gpus:
+    if gpu_index < 0 or gpu_index >= args.num_gpus:
+        raise ValueError(
+            "--disable-gpu-kernel-launch-acquire index "
+            f"{gpu_index} is outside configured GPU range 0.."
+            f"{args.num_gpus - 1}"
+        )
 
 requires(
     isa_required=ISA.X86,
@@ -155,8 +167,8 @@ for gpu_index in range(args.num_gpus):
     gpus.append(SEVegaGPU(config))
     gpu_memories.append(SingleChannelHBM(size=args.gpu_memory_size))
 
-if args.disable_gpu0_kernel_launch_acquire:
-    gpus[0].impl_kern_launch_acq = False
+for gpu_index in disabled_launch_acquire_gpus:
+    gpus[gpu_index].impl_kern_launch_acq = False
 
 cache_hierarchy = SEViperXGMICacheHierarchy(
     cu_per_sqc=4,

@@ -1566,6 +1566,17 @@ machine(MachineType:Directory, "AMD Baseline protocol")
     pm_popMemQueue;
   }
 
+  transition(BDW_M, L3Hit, U) {
+    // Probe acknowledgements may complete before the delayed L3 hit trigger.
+    // The DMA write data has already been merged into the TBE by
+    // qdr_queueDmaRdReq; no memory response is outstanding in this path.
+    wd_writeBackData;
+    da_sendResponseDmaAck;
+    wada_wakeUpAllDependentsAddr;
+    dt_deallocateTBE;
+    ptl_popTriggerQueue;
+  }
+
   transition(BS_M, MemData, B){L3TagArrayWrite, L3DataArrayWrite} {
     mt_writeMemDataToTBE;
     wd_writeBackData;

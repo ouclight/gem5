@@ -32,6 +32,11 @@
 
 #include "gpu-compute/dispatcher.hh"
 
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include "base/output.hh"
 #include "debug/GPUAgentDisp.hh"
 #include "debug/GPUDisp.hh"
 #include "debug/GPUKernelInfo.hh"
@@ -46,6 +51,97 @@
 
 namespace gem5
 {
+
+namespace
+{
+
+constexpr const char *DisableNextLaunchAcquireMarkerPrefix =
+    "/tmp/gem5-disable-next-gpu-launch-acquire-gpu";
+constexpr const char *DisableNextLaunchAcquireMarkerNamePrefix =
+    "gem5-disable-next-gpu-launch-acquire-gpu";
+
+int
+shaderGpuIndex(const Shader *shader)
+{
+    if (shader == nullptr) {
+        return -1;
+    }
+
+    const std::string object_name = shader->name();
+    std::string::size_type pos = object_name.rfind(".gpus");
+    if (pos == std::string::npos) {
+        pos = object_name.rfind("gpus");
+    } else {
+        pos += 1;
+    }
+    if (pos == std::string::npos) {
+        return -1;
+    }
+
+    pos += 4;
+    if (pos >= object_name.size() || object_name[pos] < '0' ||
+        object_name[pos] > '9') {
+        return -1;
+    }
+
+    int index = 0;
+    while (pos < object_name.size() &&
+           object_name[pos] >= '0' && object_name[pos] <= '9') {
+        index = index * 10 + object_name[pos] - '0';
+        ++pos;
+    }
+    return index;
+}
+
+std::string
+disableNextLaunchAcquireMarkerPath(int gpu_index)
+{
+    return std::string(DisableNextLaunchAcquireMarkerPrefix) +
+        std::to_string(gpu_index);
+}
+
+std::vector<std::string>
+disableNextLaunchAcquireMarkerPaths(int gpu_index)
+{
+    const std::string marker_name =
+        std::string(DisableNextLaunchAcquireMarkerNamePrefix) +
+        std::to_string(gpu_index);
+
+    return {
+        disableNextLaunchAcquireMarkerPath(gpu_index),
+        simout.resolve(std::string("fs/tmp/") + marker_name),
+    };
+}
+
+bool
+consumeNextLaunchAcquireDisableMarker(const Shader *shader)
+{
+    const int gpu_index = shaderGpuIndex(shader);
+    if (gpu_index < 0) {
+        return false;
+    }
+
+    for (const std::string &marker :
+         disableNextLaunchAcquireMarkerPaths(gpu_index)) {
+        std::FILE *file = std::fopen(marker.c_str(), "r");
+        if (file == nullptr) {
+            continue;
+        }
+        std::fclose(file);
+        std::remove(marker.c_str());
+
+        DPRINTF(GPUDisp, "Targeted launch acquire skip for GPU%d marker %s\n",
+                gpu_index, marker.c_str());
+        DPRINTF(GPUAgentDisp,
+                "Targeted launch acquire skip for GPU%d marker %s\n",
+                gpu_index, marker.c_str());
+        return true;
+    }
+
+    return false;
+}
+
+} // anonymous namespace
 
 GPUDispatcher::GPUDispatcher(const Params &p)
     : SimObject(p), shader(nullptr), gpuCmdProc(nullptr),
@@ -159,8 +255,12 @@ GPUDispatcher::exec()
         auto task = hsaQueueEntries[exec_id];
         bool launched(false);
 
+        const bool skipLaunchAcquire =
+            shader->impl_kern_launch_acq &&
+            consumeNextLaunchAcquireDisableMarker(shader);
+
         // acq is needed before starting dispatch
-        if (shader->impl_kern_launch_acq) {
+        if (shader->impl_kern_launch_acq && !skipLaunchAcquire) {
             // try to invalidate cache
             shader->prepareInvalidate(task);
         } else {
