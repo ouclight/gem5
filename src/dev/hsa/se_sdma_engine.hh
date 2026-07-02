@@ -62,6 +62,8 @@ class SESDMAEngine : public DmaVirtDevice
     Addr ringAddr(const QueueDesc &queue) const;
     void dmaReadAddr(Addr addr, unsigned size, DmaCallback *cb, void *data);
     void dmaWriteAddr(Addr addr, unsigned size, DmaCallback *cb, void *data);
+    void dmaAtomicAddr(Addr addr, unsigned size, DmaCallback *cb, void *data,
+                       AtomicOpFunctorPtr atomic_op);
     void updateWriteIndex(uint64_t queue_id, uint64_t write_index);
     void processQueue(uint64_t queue_id);
     void decodeHeader(uint64_t queue_id, uint32_t header);
@@ -87,8 +89,6 @@ class SESDMAEngine : public DmaVirtDevice
                           std::vector<uint32_t> *data);
     void executeAtomic(uint64_t queue_id, uint32_t header,
                        const sdmaAtomic &pkt);
-    void executeAtomicData(uint64_t queue_id, uint32_t header,
-                           sdmaAtomic pkt, uint64_t *data);
     void executeConstFill(uint64_t queue_id, uint32_t header,
                           const sdmaConstFill &pkt);
     void executeCopy(uint64_t queue_id, const sdmaCopy &pkt);

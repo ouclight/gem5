@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 
+#include "base/amo.hh"
 #include "base/bitfield.hh"
 #include "debug/SESDMAEngine.hh"
 
@@ -182,6 +183,43 @@ SESDMAEngine::dmaWriteAddr(Addr addr, unsigned size, DmaCallback *cb,
                 addr, size);
         dmaWrite(addr, size, cb ? cb->getChunkEvent() : nullptr,
                  static_cast<uint8_t *>(data));
+    }
+}
+
+void
+SESDMAEngine::dmaAtomicAddr(Addr addr, unsigned size, DmaCallback *cb,
+                            void *data, AtomicOpFunctorPtr atomic_op)
+{
+    fatal_if(size == 0, "SE SDMA atomic with zero size\n");
+
+    TranslationGenPtr gen = translate(addr, size);
+    bool translated = true;
+    Addr translated_addr = 0;
+    unsigned translated_size = 0;
+    int ranges = 0;
+    for (const auto &range: *gen) {
+        if (range.fault) {
+            translated = false;
+            break;
+        }
+        translated_addr = range.paddr;
+        translated_size = range.size;
+        ranges++;
+    }
+
+    if (translated) {
+        fatal_if(ranges != 1 || translated_size != size,
+                 "SE SDMA atomic crosses translation ranges: addr %#lx "
+                 "size %u ranges %d translated_size %u\n",
+                 addr, size, ranges, translated_size);
+        dmaAtomic(translated_addr, size, cb ? cb->getChunkEvent() : nullptr,
+                  static_cast<uint8_t *>(data), std::move(atomic_op));
+    } else {
+        DPRINTF(SESDMAEngine,
+                "SE SDMA direct physical atomic addr %#lx size %u\n",
+                addr, size);
+        dmaAtomic(addr, size, cb ? cb->getChunkEvent() : nullptr,
+                  static_cast<uint8_t *>(data), std::move(atomic_op));
     }
 }
 
@@ -556,42 +594,26 @@ SESDMAEngine::executeAtomic(uint64_t queue_id, uint32_t header,
             queue_id, atomic_header.opcode, pkt.addr, pkt.srcData,
             pkt.cmpData, atomic_header.loop, pkt.loopInt);
 
-    auto *data = new uint64_t;
-    auto *cb = new DmaVirtCallback<uint64_t>(
-        [ = ] (const uint64_t &)
-        { executeAtomicData(queue_id, header, pkt, data); });
-    dmaReadAddr(pkt.addr, sizeof(*data), cb, data);
-}
-
-void
-SESDMAEngine::executeAtomicData(uint64_t queue_id, uint32_t header,
-                                sdmaAtomic pkt, uint64_t *data)
-{
-    sdmaAtomicHeader atomic_header;
-    atomic_header.ordinal = header;
-
     if (atomic_header.opcode != SDMA_ATOMIC_ADD64) {
-        delete data;
         fatal("SE SDMA unsupported ATOMIC opcode %#x\n",
               atomic_header.opcode);
     }
 
-    const auto old_value = static_cast<int64_t>(*data);
     const auto addend = static_cast<int64_t>(pkt.srcData);
-    const auto new_value = static_cast<uint64_t>(old_value + addend);
 
     DPRINTF(SESDMAEngine,
-            "SDMA atomic ADD64 queue %lu addr %#lx old %#lx src %#lx "
-            "new %#lx\n",
-            queue_id, pkt.addr, *data, pkt.srcData, new_value);
+            "SDMA atomic ADD64 queue %lu addr %#lx src %#lx via Ruby atomic\n",
+            queue_id, pkt.addr, pkt.srcData);
 
-    *data = new_value;
+    auto *data = new uint64_t;
     auto *cb = new DmaVirtCallback<uint64_t>(
         [ = ] (const uint64_t &) {
             delete data;
             finishPacket(queue_id);
         });
-    dmaWriteAddr(pkt.addr, sizeof(*data), cb, data);
+    dmaAtomicAddr(pkt.addr, sizeof(*data), cb, data,
+                  std::make_unique<AtomicOpAdd<uint64_t>>(
+                      static_cast<uint64_t>(addend)));
 }
 
 void

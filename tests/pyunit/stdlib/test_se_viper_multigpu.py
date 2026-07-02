@@ -57,6 +57,73 @@ def _load_worktree_se_viper_board():
 
 
 class SEViperMultiGPUTest(unittest.TestCase):
+    def test_directory_b_state_debug_instrumentation_removed_after_sdma_fix(self):
+        protocol = Path(
+            "src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm"
+        ).read_text()
+        ruby_sconscript = Path("src/mem/ruby/SConscript").read_text()
+
+        temporary_markers = [
+            "dir MemData-debug before trigger",
+            "dir B-debug stall core-side",
+            "dir B-debug stall dma",
+            "dir B-debug exit CoreUnblock",
+            "dir B-debug exit UnblockWriteThrough",
+            "dir B-debug enter from MemData response",
+            "dir B-debug enter from ProbeAcksComplete",
+            "intToAddress(20213376)",
+            "DPRINTF(RubyDirSDMADebug",
+        ]
+        for marker in temporary_markers:
+            self.assertNotIn(marker, protocol)
+        self.assertNotIn("RubyDirSDMADebug", ruby_sconscript)
+
+    def test_se_sdma_atomic_uses_single_ruby_atomic_request(self):
+        header = Path("src/dev/hsa/se_sdma_engine.hh").read_text()
+        source = Path("src/dev/hsa/se_sdma_engine.cc").read_text()
+        dma_header = Path("src/dev/dma_device.hh").read_text()
+        dma_source = Path("src/dev/dma_device.cc").read_text()
+        dma_sequencer_source = Path(
+            "src/mem/ruby/system/DMASequencer.cc"
+        ).read_text()
+        dma_protocol = Path(
+            "src/mem/ruby/protocol/MOESI_AMD_Base-dma.sm"
+        ).read_text()
+        dir_protocol = Path(
+            "src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm"
+        ).read_text()
+        msg_protocol = Path(
+            "src/mem/ruby/protocol/MOESI_AMD_Base-msg.sm"
+        ).read_text()
+
+        self.assertIn("dmaAtomicAddr", header)
+        self.assertIn("dmaAtomic", dma_header)
+        self.assertIn("AtomicOpFunctorPtr", dma_header)
+        self.assertIn("Request::ATOMIC_RETURN_OP, std::move(atomic_op)",
+                      dma_header)
+        self.assertIn("AtomicOpFunctorPtr atomic_op", dma_source)
+        self.assertIn("std::move(atomic_op)", dma_source)
+        self.assertIn("pkt->cmd = MemCmd::WriteReq", dma_sequencer_source)
+        self.assertIn("#include \"base/amo.hh\"", source)
+        self.assertIn("std::make_unique<AtomicOpAdd<uint64_t>>", source)
+        self.assertIn("dmaAtomicAddr(pkt.addr", source)
+        self.assertIn("ATOMIC,        desc=\"Atomic read-modify-write\"", msg_protocol)
+        self.assertIn("WriteMask writeMask", msg_protocol)
+        self.assertIn("SequencerRequestType:ATOMIC", dma_protocol)
+        self.assertIn("DMARequestType:ATOMIC", dma_protocol)
+        self.assertIn("dma_sequencer.atomicCallback", dma_protocol)
+        self.assertIn("in_msg.Type == DMARequestType:ATOMIC", dir_protocol)
+        self.assertIn("tbe.atomicData := true", dir_protocol)
+        self.assertIn("out_msg.Type := DMAResponseType:DATA", dir_protocol)
+
+        execute_atomic = source[
+            source.index("SESDMAEngine::executeAtomic("):
+            source.index("SESDMAEngine::executeConstFill(")
+        ]
+        self.assertNotIn("executeAtomicData", execute_atomic)
+        self.assertNotIn("dmaReadAddr(pkt.addr", execute_atomic)
+        self.assertNotIn("dmaWriteAddr(pkt.addr", execute_atomic)
+
     def test_default_gpu_nodes_scale_past_two_devices(self):
         nodes = default_xgmi_gpu_nodes(
             num_gpus=4,
@@ -670,10 +737,46 @@ class SEViperMultiGPUTest(unittest.TestCase):
         self.assertIn("HIP_MEMSET_PRELOAD_PASSED", preload_smoke)
         self.assertIn("hip_memset_preload_smoke", makefile)
 
+    def test_hip_malloc_smoke_contract(self):
+        source = Path(
+            "tests/test-progs/gpu/hip-api-smoke/hip_malloc_smoke.hip"
+        ).read_text()
+        makefile = Path(
+            "tests/test-progs/gpu/hip-api-smoke/Makefile"
+        ).read_text()
+
+        self.assertIn("parse_device", source)
+        self.assertIn('"--device"', source)
+        self.assertIn("hipSetDevice(device)", source)
+        self.assertIn("hipMalloc(&device_data", source)
+        self.assertIn("HIP_API_MALLOC_PASSED device=%d", source)
+        self.assertIn("m5_exit(0)", source)
+        self.assertNotIn("hipFree(", source)
+        self.assertIn("hip_malloc_smoke", makefile)
+
+    def test_hip_memcpy_preload_smoke_contract(self):
+        source = Path(
+            "tests/test-progs/gpu/hip-api-smoke/hip_memcpy_preload_smoke.hip"
+        ).read_text()
+        makefile = Path(
+            "tests/test-progs/gpu/hip-api-smoke/Makefile"
+        ).read_text()
+
+        self.assertIn("hipMemcpy(device_data, input", source)
+        self.assertIn("hipMemcpy(output", source)
+        self.assertIn("hipMemcpyHostToDevice", source)
+        self.assertIn("hipMemcpyDeviceToHost", source)
+        self.assertIn("HIP_MEMCPY_PRELOAD_PASSED", source)
+        self.assertIn("m5_exit(0)", source)
+        self.assertIn("hip_memcpy_preload_smoke", makefile)
+
     def test_se_hip_memset_compatibility_layer_contract(self):
         root = Path(
             "tests/test-progs/gpu/hip-api-smoke/se_hip_compat"
         )
+        preload_smoke = Path(
+            "tests/test-progs/gpu/hip-api-smoke/hip_memset_preload_smoke.hip"
+        ).read_text()
         kernel = (root / "se_hip_memset.hip").read_text()
         wrapper = (root / "se_hip_compat.cpp").read_text()
         makefile = (root / "Makefile").read_text()
@@ -693,6 +796,27 @@ class SEViperMultiGPUTest(unittest.TestCase):
         self.assertIn("--offload-arch=gfx900", makefile)
         self.assertIn("-mno-code-object-v3", makefile)
         self.assertIn("-shared", makefile)
+        self.assertIn("HIP_MEMSET_PRELOAD_PASSED", preload_smoke)
+        self.assertIn(
+            "volatile const unsigned char *observed",
+            preload_smoke,
+        )
+        self.assertIn("m5_exit(0)", preload_smoke)
+        self.assertNotIn("hipMemcpy", preload_smoke)
+
+    def test_se_hip_memcpy_compatibility_layer_contract(self):
+        wrapper = Path(
+            "tests/test-progs/gpu/hip-api-smoke/se_hip_compat/"
+            "se_hip_compat.cpp"
+        ).read_text()
+
+        self.assertIn("hipMemcpy(void *dst", wrapper)
+        self.assertIn("hipMemcpyHostToDevice", wrapper)
+        self.assertIn("hipMemcpyDeviceToHost", wrapper)
+        self.assertIn("hipMemcpyDeviceToDevice", wrapper)
+        self.assertIn("hsa_amd_memory_async_copy", wrapper)
+        self.assertIn("hsa_signal_wait_scacquire", wrapper)
+        self.assertIn("RTLD_NEXT", wrapper)
 
     def test_peer_invalidate_diagnostic_has_host_sequenced_phases(self):
         root = Path("tests/test-progs/gpu/xgmi-peer-invalidate")
@@ -1041,6 +1165,60 @@ class SEViperMultiGPUTest(unittest.TestCase):
         self.assertIn("std::remove(marker.c_str())", dispatcher)
         self.assertIn("skipLaunchAcquire", dispatcher)
 
+    def test_remote_shader_resident_flag_smoke_is_standalone(self):
+        root = Path("tests/test-progs/gpu/xgmi-peer-vram")
+        host = (root / "hsa_remote_shader_resident_flag.cpp").read_text()
+        kernels = (root / "resident_flag_kernels.hip").read_text()
+        makefile = (root / "Makefile").read_text()
+
+        self.assertIn("hsa_remote_shader_resident_flag", makefile)
+        self.assertIn("hsa_remote_shader_resident_flag.cpp", makefile)
+        self.assertIn("resident_flag_kernels.hip", makefile)
+        self.assertIn("resident_flag_kernels.hsaco", makefile)
+        self.assertIn("RESIDENT_FLAG_HSACO_PATH", host)
+
+        self.assertIn("ResidentFlagControl", host)
+        self.assertIn("LayoutSameLine", host)
+        self.assertIn("LayoutSplitLine", host)
+        self.assertIn("SyncStrict", host)
+        self.assertIn("SyncWriterFenceOnly", host)
+        self.assertIn("SyncNoFence", host)
+        self.assertIn('"--reverse"', host)
+        self.assertIn('"--layout"', host)
+        self.assertIn('"--sync"', host)
+        self.assertIn("RESIDENT_FLAG_RESULT", host)
+        self.assertIn("RESIDENT_FLAG_PASSED_UPDATED", host)
+        self.assertIn("RESIDENT_FLAG_OBSERVED_STALE_VALUE", host)
+        self.assertIn("RESIDENT_FLAG_FLAG_TIMEOUT", host)
+        self.assertIn("RESIDENT_FLAG_FAILED_UNEXPECTED", host)
+        self.assertNotIn("hipMemcpy", host)
+        self.assertNotIn("hipMemset", host)
+
+        self.assertIn("resident_flag_reader", kernels)
+        self.assertIn("resident_flag_writer", kernels)
+        self.assertIn("__threadfence_system", kernels)
+        self.assertIn("value_dword", kernels)
+        self.assertIn("flag_dword", kernels)
+        self.assertIn("resident_flag_reader(const uint32_t *target", kernels)
+        self.assertIn("volatile_load_u32(&target[flag_dword])", kernels)
+
+        value_store = kernels.index("target[value_dword] = updated_value")
+        first_fence = kernels.index("__threadfence_system", value_store)
+        flag_store = kernels.index("target[flag_dword] = 1", first_fence)
+        self.assertLess(value_store, first_fence)
+        self.assertLess(first_fence, flag_store)
+
+        first_read = kernels.index(
+            "const uint32_t first = target[value_dword]"
+        )
+        flag_poll = kernels.index("target[flag_dword]", first_read)
+        second_read = kernels.index(
+            "const uint32_t second = target[value_dword]",
+            flag_poll,
+        )
+        self.assertLess(first_read, flag_poll)
+        self.assertLess(flag_poll, second_read)
+
     def test_xgmi_multigpu_config_can_disable_launch_acquire_per_gpu(self):
         config = Path(
             "configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py"
@@ -1220,7 +1398,7 @@ class SEViperMultiGPUTest(unittest.TestCase):
             "executeConstFill",
             "executeCopy",
             "executeAtomic",
-            "executeAtomicData",
+            "dmaAtomicAddr",
             "dumpRingDwords",
             "dumpRingDwordsData",
             "writeDoorbell",

@@ -1,5 +1,6 @@
 #include <hip/hip_runtime_api.h>
 #include <hsa/hsa.h>
+#include <hsa/hsa_ext_amd.h>
 
 #include <dlfcn.h>
 
@@ -15,6 +16,8 @@ namespace
 {
 
 using GetDevice = hipError_t (*)(int *);
+using RealHipMemcpy =
+    hipError_t (*)(void *, const void *, size_t, hipMemcpyKind);
 
 struct Runtime
 {
@@ -378,6 +381,45 @@ dispatch(void *dst, int value, std::size_t size)
     return result == 0 ? hipSuccess : hipErrorLaunchFailure;
 }
 
+hipError_t
+asyncCopyAndWait(void *dst, const void *src, std::size_t sizeBytes)
+{
+    hsa_signal_t completion = {};
+    hsa_status_t status = hsa_signal_create(1, 0, nullptr, &completion);
+    if (status != HSA_STATUS_SUCCESS) {
+        return hsaError("hsa_signal_create", status);
+    }
+
+    std::call_once(initializeOnce, initialize);
+    if (initializationError != hipSuccess) {
+        hsa_signal_destroy(completion);
+        return initializationError;
+    }
+
+    status = hsa_amd_memory_async_copy(
+        dst,
+        runtime.agent,
+        src,
+        runtime.agent,
+        sizeBytes,
+        0,
+        nullptr,
+        completion);
+    if (status != HSA_STATUS_SUCCESS) {
+        hsa_signal_destroy(completion);
+        return hsaError("hsa_amd_memory_async_copy", status);
+    }
+
+    const hsa_signal_value_t result = hsa_signal_wait_scacquire(
+        completion,
+        HSA_SIGNAL_CONDITION_LT,
+        1,
+        UINT64_MAX,
+        HSA_WAIT_STATE_BLOCKED);
+    hsa_signal_destroy(completion);
+    return result == 0 ? hipSuccess : hipErrorUnknown;
+}
+
 } // anonymous namespace
 
 extern "C" hipError_t
@@ -394,4 +436,33 @@ hipMemset(void *dst, int value, size_t sizeBytes)
         return initializationError;
     }
     return dispatch(dst, value, sizeBytes);
+}
+
+extern "C" hipError_t
+hipMemcpy(void *dst, const void *src, size_t sizeBytes, hipMemcpyKind kind)
+{
+    if (sizeBytes == 0) {
+        return hipSuccess;
+    }
+    if (dst == nullptr || src == nullptr) {
+        return hipErrorInvalidValue;
+    }
+
+    if (kind == hipMemcpyHostToHost) {
+        std::memcpy(dst, src, sizeBytes);
+        return hipSuccess;
+    }
+
+    if (kind == hipMemcpyHostToDevice ||
+        kind == hipMemcpyDeviceToHost ||
+        kind == hipMemcpyDeviceToDevice) {
+        return asyncCopyAndWait(dst, src, sizeBytes);
+    }
+
+    auto realHipMemcpy = reinterpret_cast<RealHipMemcpy>(
+        dlsym(RTLD_NEXT, "hipMemcpy"));
+    if (realHipMemcpy == nullptr) {
+        return hipErrorSharedObjectSymbolNotFound;
+    }
+    return realHipMemcpy(dst, src, sizeBytes, kind);
 }

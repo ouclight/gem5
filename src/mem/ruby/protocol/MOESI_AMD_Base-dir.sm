@@ -312,6 +312,8 @@ machine(MachineType:Directory, "AMD Baseline protocol")
           }
         } else if (in_msg.Type == DMARequestType:WRITE) {
           trigger(Event:DmaWrite, in_msg.LineAddress, entry, tbe);
+        } else if (in_msg.Type == DMARequestType:ATOMIC) {
+          trigger(Event:DmaWrite, in_msg.LineAddress, entry, tbe);
         } else {
           error("Unknown DMA msg");
         }
@@ -456,11 +458,21 @@ machine(MachineType:Directory, "AMD Baseline protocol")
   }
 
   action(da_sendResponseDmaAck, "da", desc="send DMA data response") {
-    enqueue(dmaResponseQueue_out, DMAResponseMsg, response_latency) {
-      out_msg.LineAddress := address;
-      out_msg.Type := DMAResponseType:ACK;
-      out_msg.Destination.add(tbe.OriginalRequestor);
-      out_msg.MessageSize := MessageSizeType:Response_Control;
+    if (tbe.atomicData) {
+      enqueue(dmaResponseQueue_out, DMAResponseMsg, response_latency) {
+        out_msg.LineAddress := address;
+        out_msg.Type := DMAResponseType:DATA;
+        out_msg.Destination.add(tbe.OriginalRequestor);
+        out_msg.DataBlk := tbe.DataBlk;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+      }
+    } else {
+      enqueue(dmaResponseQueue_out, DMAResponseMsg, response_latency) {
+        out_msg.LineAddress := address;
+        out_msg.Type := DMAResponseType:ACK;
+        out_msg.Destination.add(tbe.OriginalRequestor);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
     }
   }
 
@@ -1047,6 +1059,13 @@ machine(MachineType:Directory, "AMD Baseline protocol")
         } else {
           tbe.writeMask.fillMask();
         }
+      } else if (in_msg.Type == DMARequestType:ATOMIC) {
+        tbe.atomicData := true;
+        tbe.atomicDataReturn := true;
+        tbe.DataBlk := in_msg.DataBlk;
+        tbe.writeMask.clear();
+        tbe.writeMask.orMask(in_msg.writeMask);
+        tbe.isSLCSet := true;
       }
     }
   }
@@ -1358,18 +1377,30 @@ machine(MachineType:Directory, "AMD Baseline protocol")
   */
 
   // TRANSITIONS
-  transition({BL, BL2, BL2_Pm, BL2_M, BDR_M, BDW_M, BS_M, BM_M, B_M, BP, BDR_PM, BDW_PM, BS_PM, BM_PM, B_PM, BDR_Pm, BDW_Pm, BS_Pm, BM_Pm, B_Pm, B}, {RdBlkS, RdBlkM, RdBlk, CtoD}) {
+  transition({BL, BL2, BL2_Pm, BL2_M, BDR_M, BDW_M, BS_M, BM_M, B_M, BP, BDR_PM, BDW_PM, BS_PM, BM_PM, B_PM, BDR_Pm, BDW_Pm, BS_Pm, BM_Pm, B_Pm}, {RdBlkS, RdBlkM, RdBlk, CtoD}) {
+      st_stallAndWaitRequest;
+  }
+
+  transition(B, {RdBlkS, RdBlkM, RdBlk, CtoD}) {
       st_stallAndWaitRequest;
   }
 
     // It may be possible to save multiple invalidations here!
-  transition({BL, BL2, BL2_Pm, BL2_M, BS_M, BM_M, B_M, BP, BS_PM, BM_PM, B_PM, BS_Pm, BM_Pm, B_Pm, B}, {Atomic, WriteThrough}) {
+  transition({BL, BL2, BL2_Pm, BL2_M, BS_M, BM_M, B_M, BP, BS_PM, BM_PM, B_PM, BS_Pm, BM_Pm, B_Pm}, {Atomic, WriteThrough}) {
+      st_stallAndWaitRequest;
+  }
+
+  transition(B, {Atomic, WriteThrough}) {
       st_stallAndWaitRequest;
   }
 
   // The exit state is always going to be U, so wakeUpDependents logic should be covered in all the
   // transitions which are flowing into U.
-  transition({BL, BL2, BL2_Pm, BL2_M, BDR_M, BDW_M, BS_M, BM_M, B_M, BP, BDR_PM, BDW_PM, BS_PM, BM_PM, B_PM, BDR_Pm, BDW_Pm, BS_Pm, BM_Pm, B_Pm, B}, {DmaRead, DmaReadWB, DmaWrite}){
+  transition({BL, BL2, BL2_Pm, BL2_M, BDR_M, BDW_M, BS_M, BM_M, B_M, BP, BDR_PM, BDW_PM, BS_PM, BM_PM, B_PM, BDR_Pm, BDW_Pm, BS_Pm, BM_Pm, B_Pm}, {DmaRead, DmaReadWB, DmaWrite}){
+    sd_stallAndWaitRequest;
+  }
+
+  transition(B, {DmaRead, DmaReadWB, DmaWrite}){
     sd_stallAndWaitRequest;
   }
 

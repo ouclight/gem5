@@ -2,6 +2,2418 @@
 
 Last updated: 2026-06-18
 
+## 2026-07-01 Narrow SDMA signal-line Directory markers before MemData trigger
+
+The previous `hipMemcpy` preload trace showed that the first H2D signal atomic
+did exit Directory state `B`, while the second D2H signal atomic was followed
+by `B + MemData` on signal line `0x1346e80`. Codex narrowed the instrumentation
+to confirm whether a second memory response arrives while the line is already
+in `B`.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,260p' AGENTS.md
+sed -n '1,260p' docs/debug/se-multigpu-status.md
+git status --short
+git diff -- src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm tests/pyunit/stdlib/test_se_viper_multigpu.py src/mem/ruby/SConscript docs/debug/se-multigpu-status.md
+sed -n '1,240p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/systematic-debugging/SKILL.md
+nl -ba src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm | sed -n '430,475p'
+nl -ba src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm | sed -n '1328,1385p'
+rg -n "memQueue_in|MemoryMsg|MEMORY_READ|trigger\(Event:MemData" src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm
+rg -n "DirectoryState|DPRINTF\(.*state|state %s|getDirectoryEntry\(.*\)\.DirectoryState" src/mem/ruby/protocol/*.sm
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_directory_b_state_debug_instrumentation_contract
+git diff --check
+rg -n "dir MemData-debug|dir B-debug|dir DMA-debug|0x1346e80|RubyDirSDMADebug" src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm tests/pyunit/stdlib/test_se_viper_multigpu.py src/mem/ruby/SConscript
+```
+
+First relevant result:
+
+- Focused structural test passed:
+  `Ran 1 test ... OK`.
+- `git diff --check` passed.
+- `rg` confirms there are no remaining `dir DMA-debug response` protocol
+  markers.
+
+Facts confirmed:
+
+- The broad per-DMA-response `DATA/ACK` markers were removed to avoid
+  cache-line-per-copy trace growth.
+- All `dir B-debug ...` markers are now gated to `address == 0x1346e80`.
+- A new `dir MemData-debug before trigger addr 0x%x state %s` marker was added
+  immediately before `trigger(Event:MemData, ...)`, gated to
+  `in_msg.addr == 0x1346e80`.
+- No protocol transition semantics were changed in this step.
+
+Hypotheses accepted or rejected:
+
+- Accepted for the next run: if the panic is due to a duplicate/delayed memory
+  response, the trace should show `dir MemData-debug before trigger ... state B`
+  immediately before the invalid transition.
+- Rejected for this step: collecting all DMA response line markers is useful;
+  it is too noisy for the current root-cause question.
+
+Files changed:
+
+- `src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- Focused pyunit contract passed.
+- `git diff --check` passed.
+- No full gem5 rebuild or simulation was run by Codex.
+
+Follow-up compile fix:
+
+The user's gem5 rebuild reported a SLICC parser error:
+
+```text
+Syntax error at .../MOESI_AMD_Base-dir.sm:392
+>>x1346e80<<
+```
+
+Codex replaced the raw hexadecimal address literal in SLICC conditions with
+the existing SLICC utility conversion:
+
+```text
+intToAddress(20213376)
+```
+
+where `20213376 == 0x1346e80`. The diagnostic target address is unchanged.
+
+Commands run by Codex:
+
+```bash
+rg -n "if \(.*addr.*==|if \(address ==|0x[0-9a-fA-F]+" src/mem/ruby/protocol/*.sm | head -120
+printf '%d\n' 0x1346e80
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_directory_b_state_debug_instrumentation_contract
+git diff --check
+rg -n "== 0x1346e80|intToAddress\(20213376\)|dir MemData-debug|dir B-debug|dir DMA-debug" src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm tests/pyunit/stdlib/test_se_viper_multigpu.py
+```
+
+Verification completed:
+
+- Focused pyunit contract passed.
+- `git diff --check` passed.
+- `rg` confirms no remaining `== 0x1346e80` conditions.
+- Codex did not run a full gem5 rebuild.
+
+Single next diagnostic step: rebuild gem5 and rerun the same preload
+`hipMemcpy` smoke with `RubyDirSDMADebug` enabled, then inspect only the
+signal-line events:
+
+```bash
+rg -n "dir MemData-debug|dir B-debug|0x1346e80|0x7ffdeee7ae88|Invalid transition|SDMA atomic|doorbell route queue_id 2" m5out-hip-api-memcpy-preload-bdebug/hip-api-memcpy-preload.trace m5out-hip-api-memcpy-preload-bdebug/simerr.txt
+```
+
+Follow-up trace result:
+
+The user rebuilt and reran the preload `hipMemcpy` smoke in:
+
+`m5out-hip-api-memcpy-preload-bdebug`
+
+Commands run by Codex:
+
+```bash
+find m5out-hip-api-memcpy-preload-bdebug -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+tail -120 m5out-hip-api-memcpy-preload-bdebug/simout.txt
+tail -220 m5out-hip-api-memcpy-preload-bdebug/simerr.txt
+rg -n "dir MemData-debug|dir B-debug|0x1346e80|0x7ffdeee7ae88|Invalid transition|SDMA atomic|doorbell route queue_id 2|HIP_MEMCPY_PRELOAD|begin hipMemcpy|end hipMemcpy|PASSED|FAILED" m5out-hip-api-memcpy-preload-bdebug/hip-api-memcpy-preload.trace m5out-hip-api-memcpy-preload-bdebug/simerr.txt m5out-hip-api-memcpy-preload-bdebug/simout.txt
+sed -n '17090,17150p' m5out-hip-api-memcpy-preload-bdebug/hip-api-memcpy-preload.trace
+rg -n "SDMA queue 2 header|SDMA copy|SDMA atomic|queue 2 drained|doorbell route queue_id 2|dir MemData-debug|dir B-debug|Invalid transition" m5out-hip-api-memcpy-preload-bdebug/hip-api-memcpy-preload.trace m5out-hip-api-memcpy-preload-bdebug/simerr.txt
+rg -n "state_declaration|BDW_M|B_M|transition\(.*MemData|MemData, B|transition\(B, MemData|transition\(\{B" src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm
+nl -ba src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm | sed -n '80,180p'
+nl -ba src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm | sed -n '1540,1710p'
+nl -ba src/dev/hsa/se_sdma_engine.cc | sed -n '520,610p'
+nl -ba src/mem/ruby/system/DMASequencer.cc | sed -n '90,155p'
+nl -ba src/mem/ruby/system/DMASequencer.cc | sed -n '270,310p'
+```
+
+First relevant result:
+
+```text
+47159994133: SDMA atomic queue 2 op 0x2f addr 0x7ffdeee7ae88 ...
+47160028099: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ae88 old 0x1 src 0xffffffffffffffff new 0
+47160061065: dir MemData-debug before trigger addr 0x1346e80 state BDW_M
+47160080712: dir MemData-debug before trigger addr 0x1346e80 state B_M
+47160080712: dir B-debug enter from MemData response addr 0x1346e80
+47160080712: dir MemData-debug before trigger addr 0x1346e80 state B
+```
+
+The run still aborts with:
+
+```text
+addr: 0x1346e80 event: MemData state: B
+```
+
+Facts confirmed:
+
+- The diagnostic marker confirms the invalid transition is immediately
+  preceded by `state B` receiving `MemData`.
+- The second D2H completion signal line sees three close `MemData` events:
+  `BDW_M`, then `B_M`, then `B`.
+- `B_M + MemData -> B` is a legal protocol transition; the following
+  `B + MemData` is the invalid event.
+- Source inspection confirms `SESDMAEngine::executeAtomic()` currently
+  implements SDMA atomic ADD64 as `dmaReadAddr()` followed by `dmaWriteAddr()`,
+  not as one Ruby atomic RMW transaction.
+- `DMASequencer` already has atomic request/callback support when the packet
+  has `req->isAtomic()`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the immediate panic is a duplicate/overlapping memory response on
+  the signal line after it has entered `B`.
+- Accepted as the strongest root-cause candidate: the SE SDMA atomic
+  completion signal is split into separate read and write DMA transactions,
+  allowing interleaving with runtime/CPU signal accesses and creating multiple
+  outstanding transactions on the same signal cache line.
+- Rejected as a primary fix: adding a blind `B + MemData` ignore transition in
+  Directory would hide the symptom and could drop real data; the atomic source
+  path should be fixed first.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of trace, simerr, protocol transitions, and
+  `SESDMAEngine`/`DMASequencer` source.
+- No source fix, rebuild, or full simulation was run by Codex in this step.
+
+Single next diagnostic step: implement SE SDMA ATOMIC ADD64 using a single
+Ruby atomic request through `DMASequencer` rather than a read-then-write pair,
+then rerun the same preload `hipMemcpy` smoke.
+
+Follow-up implementation:
+
+The user accepted the recommendation. Codex implemented the minimal single
+Ruby atomic path for SE SDMA ADD64 completion signals.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/test-driven-development/SKILL.md
+git status --short
+git diff -- src/dev/hsa/se_sdma_engine.cc src/dev/hsa/se_sdma_engine.hh tests/pyunit/stdlib/test_se_viper_multigpu.py docs/debug/se-multigpu-status.md
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_se_sdma_atomic_uses_single_ruby_atomic_request
+nl -ba src/dev/dma_device.cc | sed -n '120,225p'
+nl -ba src/dev/dma_virt_device.hh | sed -n '1,180p'
+nl -ba src/dev/hsa/se_sdma_engine.cc | sed -n '540,600p'
+nl -ba src/mem/ruby/protocol/MOESI_AMD_Base-dma.sm | sed -n '1,190p'
+nl -ba src/mem/ruby/protocol/MOESI_AMD_Base-msg.sm | sed -n '379,405p'
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_se_sdma_atomic_uses_single_ruby_atomic_request test_se_viper_multigpu.SEViperMultiGPUTest.test_se_sdma_engine_has_phase1_packet_handlers test_se_viper_multigpu.SEViperMultiGPUTest.test_directory_b_state_debug_instrumentation_contract
+git diff --check
+rg -n "executeAtomicData|dmaReadAddr\(pkt.addr|dmaWriteAddr\(pkt.addr|DMARequestType:ATOMIC|SequencerRequestType:ATOMIC|dma_sequencer.atomicCallback|dmaAtomicAddr|AtomicOpAdd|AtomicOpFunctorPtr|out_msg.writeMask" src/dev/dma_device.* src/dev/hsa/se_sdma_engine.* src/mem/ruby/protocol/MOESI_AMD_Base-*.sm tests/pyunit/stdlib/test_se_viper_multigpu.py
+```
+
+First relevant result:
+
+- RED failed before implementation:
+  `AssertionError: 'dmaAtomicAddr' not found`.
+- GREEN passed after implementation:
+  `Ran 3 tests ... OK`.
+
+Facts confirmed:
+
+- `SESDMAEngine::executeAtomic()` no longer calls `executeAtomicData()`,
+  `dmaReadAddr(pkt.addr, ...)`, or `dmaWriteAddr(pkt.addr, ...)`.
+- `SESDMAEngine::executeAtomic()` now issues `SDMA_ATOMIC_ADD64` through
+  `dmaAtomicAddr(pkt.addr, ..., std::make_unique<AtomicOpAdd<uint64_t>>(...))`.
+- `DmaPort`/`DmaDevice` now support a `MemCmd::SwapReq` DMA action carrying an
+  `AtomicOpFunctorPtr`.
+- The GPU_VIPER DMA SLICC path now recognizes
+  `SequencerRequestType:ATOMIC`, forwards `DMARequestType:ATOMIC`, preserves
+  `WriteMask`, and calls `dma_sequencer.atomicCallback(...)` on DATA response.
+- The Directory treats `DMARequestType:ATOMIC` as a DMA write-style RMW path:
+  it reads the memory line, applies `atomicPartial` via existing
+  `wd_writeBackData`, writes memory, and returns DATA to the DMA controller.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the correct first fix layer is the SE SDMA atomic source path, not
+  a blind `B + MemData` swallow transition in Directory.
+- Still to verify by full run: whether this single Ruby atomic path eliminates
+  the `B + MemData` panic in `hipMemcpy` preload.
+
+Files changed:
+
+- `src/dev/dma_device.hh`
+- `src/dev/dma_device.cc`
+- `src/dev/hsa/se_sdma_engine.hh`
+- `src/dev/hsa/se_sdma_engine.cc`
+- `src/mem/ruby/protocol/MOESI_AMD_Base-msg.sm`
+- `src/mem/ruby/protocol/MOESI_AMD_Base-dma.sm`
+- `src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- TDD RED focused pyunit failed for the missing single-atomic path.
+- TDD GREEN focused pyunit passed after implementation.
+- Related SDMA phase1 and Directory debug structural tests passed.
+- `git diff --check` passed.
+- Codex did not run a full gem5 rebuild or simulation.
+
+Single next diagnostic step: rebuild gem5 and rerun the same preload
+`hipMemcpy` smoke. In the new trace, `SDMA atomic ADD64 ... via Ruby atomic`
+should appear, and the previous read-then-write signal-line sequence should no
+longer produce `B + MemData`.
+
+## 2026-07-01 Targeted Directory B-state instrumentation for SDMA signal panic
+
+The user hypothesized that the first H2D completion signal may leave the
+signal line in Directory state `B`, so the second D2H signal operation observes
+that blocked state. Codex added targeted protocol instrumentation to validate
+that hypothesis without changing protocol semantics.
+
+Commands run by Codex:
+
+```bash
+git status --short
+sed -n '1,140p' docs/debug/se-multigpu-status.md
+nl -ba src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm | sed -n '430,570p'
+nl -ba src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm | sed -n '1300,1510p'
+nl -ba src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm | sed -n '1550,1630p'
+nl -ba src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm | sed -n '1748,1788p'
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_directory_b_state_debug_instrumentation_contract
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_directory_b_state_debug_instrumentation_contract
+git diff --check
+rg -n "dir B-debug|dir DMA-debug|transition\(B,|transition\(\{B\}" src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm
+```
+
+First relevant result:
+
+- RED failed as expected before instrumentation:
+  `AssertionError: 'dir B-debug stall core-side' not found`.
+- GREEN passed after instrumentation:
+  `Ran 1 test ... OK`.
+
+Facts confirmed:
+
+- `B` is still not treated as `AccessPermission:Busy`; no state semantics were
+  changed.
+- The instrumentation only adds `DPRINTF(RubySlicc, ...)` markers.
+- The original grouped `B` transitions were split only to isolate `B` logging
+  from other blocked states:
+  - `B + core-side request` logs `dir B-debug stall core-side`;
+  - `B + DmaRead/DmaReadWB/DmaWrite` logs `dir B-debug stall dma`;
+  - `B + CoreUnblock -> U` logs `dir B-debug exit CoreUnblock`;
+  - `B + UnblockWriteThrough -> U` logs
+    `dir B-debug exit UnblockWriteThrough`;
+  - transitions entering `B` after memory data or L3-hit response log
+    `dir B-debug enter from MemData response`;
+  - transitions entering `B` after probe acknowledgements log
+    `dir B-debug enter from ProbeAcksComplete`;
+  - DMA responses log `dir DMA-debug response DATA/ACK`.
+
+Hypotheses accepted or rejected:
+
+- Accepted for testing: if the signal line remains in `B` after the first H2D,
+  the rerun should show an enter-`B` marker without a matching exit marker
+  before the second SDMA doorbell/panic.
+- Not yet proven: whether the missing event is `CoreUnblock`,
+  `UnblockWriteThrough`, or a stale/delayed `MemData` ordering problem.
+
+Files changed:
+
+- `src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- Focused pyunit RED/GREEN contract.
+- `git diff --check` passed.
+- No gem5 rebuild or full simulation was run by Codex.
+
+Single next diagnostic step: rebuild gem5, rerun the same preload
+`hipMemcpy` smoke with `RubySlicc` added to debug flags, then grep the trace
+for the signal-line markers:
+
+```bash
+rg -n "dir B-debug|dir DMA-debug|0x1346e80|0x1346e8|Invalid transition|SDMA atomic|doorbell route queue_id 2" m5out-hip-api-memcpy-preload/hip-api-memcpy-preload.trace m5out-hip-api-memcpy-preload/simerr.txt
+```
+
+Follow-up compile fix:
+
+The user's gem5 rebuild reported a SLICC syntax error at the split
+`DPRINTF(RubySlicc, ...)` string in `dbg_b_enterMemData`. Codex changed the
+two `enter B` markers to use a single format string with only the address:
+
+```text
+dir B-debug enter from MemData response addr 0x%x
+dir B-debug enter from ProbeAcksComplete addr 0x%x
+```
+
+Commands run by Codex:
+
+```bash
+nl -ba src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm | sed -n '1360,1388p'
+rg -n "DPRINTF\(RubySlicc,.*%d|atomic %d|wt %d|l3_hit %d|dir B-debug" src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_directory_b_state_debug_instrumentation_contract
+git diff --check
+```
+
+Verification completed:
+
+- Focused pyunit still passes.
+- `git diff --check` still passes.
+- Codex did not run a full gem5 rebuild.
+
+Follow-up trace-size fix:
+
+The user reported that enabling global `RubySlicc` made the trace too large.
+Codex moved only the targeted SDMA/signal Directory markers to a dedicated
+debug flag:
+
+```text
+RubyDirSDMADebug
+```
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_directory_b_state_debug_instrumentation_contract
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_directory_b_state_debug_instrumentation_contract
+git diff --check
+rg -n "RubyDirSDMADebug|dir B-debug|dir DMA-debug" src/mem/ruby/SConscript src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm tests/pyunit/stdlib/test_se_viper_multigpu.py
+```
+
+First relevant result:
+
+- RED failed before the flag declaration:
+  `"DebugFlag('RubyDirSDMADebug'" not found`.
+- GREEN passed after adding the flag and switching the targeted `DPRINTF`
+  calls.
+
+Facts confirmed:
+
+- `src/mem/ruby/SConscript` declares `DebugFlag('RubyDirSDMADebug')`.
+- Only the newly added markers use `DPRINTF(RubyDirSDMADebug, ...)`.
+- Existing broad `RubySlicc` debug prints remain untouched.
+- The next run should not include `RubySlicc` in `--debug-flags`.
+
+Verification completed:
+
+- Focused pyunit RED/GREEN contract.
+- `git diff --check` passed.
+- Codex did not run a full gem5 rebuild or simulation.
+
+Follow-up trace result:
+
+The user rebuilt and reran the preload `hipMemcpy` smoke with:
+
+```text
+--debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp,RubyDirSDMADebug
+```
+
+in:
+
+`m5out-hip-api-memcpy-preload-bdebug`
+
+Commands run by Codex:
+
+```bash
+find m5out-hip-api-memcpy-preload-bdebug -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+tail -120 m5out-hip-api-memcpy-preload-bdebug/simout.txt
+tail -180 m5out-hip-api-memcpy-preload-bdebug/simerr.txt
+rg -n "dir B-debug|dir DMA-debug|0x1346e80|0x1346e8|0x1346|Invalid transition|SDMA atomic|doorbell route queue_id 2|SDMA queue 2 header|SDMA queue 2 drained|HIP_MEMCPY_PRELOAD" m5out-hip-api-memcpy-preload-bdebug/hip-api-memcpy-preload.trace m5out-hip-api-memcpy-preload-bdebug/simerr.txt m5out-hip-api-memcpy-preload-bdebug/simout.txt
+rg -n "0x1346e80|0x7ffdeee7ae88|SDMA atomic|SDMA queue 2 header|doorbell route queue_id 2|SDMA queue 2 drained|Invalid transition" m5out-hip-api-memcpy-preload-bdebug/hip-api-memcpy-preload.trace m5out-hip-api-memcpy-preload-bdebug/simerr.txt
+sed -n '551450,551525p' m5out-hip-api-memcpy-preload-bdebug/hip-api-memcpy-preload.trace
+rg -n "dir B-debug (enter|exit|stall).*0x1346e80|dir DMA-debug.*0x1346e80" m5out-hip-api-memcpy-preload-bdebug/hip-api-memcpy-preload.trace
+```
+
+First relevant result:
+
+```text
+47149478991: dir DMA-debug response DATA addr 0x1346e80 requester DMA-2
+47149492312: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ae88 old 0x1 src 0xffffffffffffffff new 0
+47149548588: dir DMA-debug response ACK addr 0x1346e80 requester DMA-2
+...
+47153557242: dir B-debug enter from MemData response addr 0x1346e80
+47153561904: dir B-debug exit CoreUnblock addr 0x1346e80
+...
+47160014778: dir DMA-debug response DATA addr 0x1346e80 requester DMA-2
+47160028099: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ae88 old 0x1 src 0xffffffffffffffff new 0
+47160061065: dir DMA-debug response ACK addr 0x1346e80 requester DMA-2
+47160080712: dir B-debug enter from MemData response addr 0x1346e80
+```
+
+The run still aborts with:
+
+```text
+addr: 0x1346e80 event: MemData state: B
+```
+
+Facts confirmed:
+
+- The trace with `RubyDirSDMADebug` is smaller than full `RubySlicc`, but still
+  large because the current DMA response marker logs every DMA cache line in
+  the copy.
+- The hypothesis that the first H2D completion signal permanently leaves
+  `0x1346e80` in `B` is rejected. The same line explicitly exits `B` through
+  `CoreUnblock` after the first SDMA atomic and again before the second SDMA
+  doorbell.
+- The second D2H signal atomic sequence reaches:
+  - DMA read response for the signal line;
+  - SDMA atomic ADD64 `1 + (-1) -> 0`;
+  - DMA write ACK for the signal line.
+- After the second DMA ACK, the same line logs a core-side-style transition
+  entering `B` from `MemData response`, then the simulator panics with
+  `B + MemData`.
+
+Hypotheses accepted or rejected:
+
+- Rejected: the first H2D leaves the signal line stuck in `B`.
+- Accepted: the immediate failure is more likely a duplicate or delayed
+  `MemData` response for the same signal line after it has just entered `B`,
+  not the absence of the first H2D unblock.
+- Accepted: the problematic event is on the signal/control line, not payload
+  copy data.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only trace/log inspection only.
+
+Single next diagnostic step: reduce the marker volume and add a pre-trigger
+Directory memory-response marker that prints the current Directory state for
+`MemData` before calling `trigger(Event:MemData, ...)`. This should confirm
+whether two memory responses for `0x1346e80` arrive back-to-back and identify
+the state immediately before the invalid transition.
+
+## 2026-07-01 HIP API memcpy preload trace recheck confirms same SDMA signal panic
+
+The user reran the preload `hipMemcpy` H2D/D2H smoke and asked Codex to
+inspect the trace in:
+
+`m5out-hip-api-memcpy-preload`
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' AGENTS.md
+sed -n '1,260p' docs/debug/se-multigpu-status.md
+git status --short
+git diff --stat
+find m5out-hip-api-memcpy-preload -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+tail -120 m5out-hip-api-memcpy-preload/simout.txt
+tail -220 m5out-hip-api-memcpy-preload/simerr.txt
+rg -n "HIP_MEMCPY_PRELOAD|HIP memcpy|panic|Invalid transition|addr: 0x1346e80|SESDMA|SDMA|CREATE_QUEUE|queue_type|doorbell route|registered_sdma|hsa_amd_memory_async_copy|async|MapMemory|RegisterMemory|Unmap|processPkt|HSA AQL|Dispatching|MemData|addr 0x1346e80|0x1346e80|SDMA queue|atomic|COPY|POLL" m5out-hip-api-memcpy-preload/simout.txt m5out-hip-api-memcpy-preload/simerr.txt m5out-hip-api-memcpy-preload/hip-api-memcpy-preload.trace
+rg -n "state_declaration\(.*B|enumeration\(B|B,|MemData|transition\(.*B|B, .*MemData|MemData.*B" src/mem/ruby/protocol/GPU_VIPER-* build/VEGA_X86/mem/ruby/protocol/GPU_VIPER/Directory_Transitions.cc | head -220
+sed -n '1100,1165p' build/VEGA_X86/mem/ruby/protocol/GPU_VIPER/Directory_Transitions.cc
+rg -n "0x1346e80|1346e80|0x7ffdeee7ae88|0x7ffdeee7a000|0x7ffdee800000|Mapping VA|framebuffer PA" m5out-hip-api-memcpy-preload/simerr.txt m5out-hip-api-memcpy-preload/hip-api-memcpy-preload.trace | head -200
+rg -n "Begin Simulation Statistics|End Simulation Statistics|simTicks|finalTick|hostSeconds|simInsts|simOps" m5out-hip-api-memcpy-preload/stats.txt
+```
+
+First relevant result:
+
+```text
+build/VEGA_X86/mem/ruby/protocol/GPU_VIPER/Directory_Transitions.cc:1137: panic: Invalid transition
+board.cache_hierarchy.ruby_system.directory_controllers0 time: 141621864 addr: 0x1346e80 event: MemData state: B
+Program aborted at tick 47160080712
+```
+
+Facts confirmed:
+
+- The run still does not print `HIP_MEMCPY_PRELOAD_PASSED`.
+- The failure is the same invalid GPU_VIPER directory transition:
+  `MemData` while the directory line is in state `B`.
+- Trace again shows the interposed path reaches SDMA queue 2 and routes
+  doorbells to `SESDMAEngine`.
+- The SDMA sequence is `POLL_REGMEM`, `COPY`, then `ATOMIC` completion-signal
+  decrement.
+- The panic address `0x1346e80` maps inside the signal/control allocation
+  `VA 0x7ffdeee7a000 -> PA 0x1346000`, not inside the payload device buffer
+  `VA 0x7ffdee800000 -> PA 0x100000000`.
+- The protocol-generated transition table has no valid
+  `Directory_State_B + Directory_Event_MemData` transition; `MemData` is
+  accepted in transient states such as `BDR_PM`, `BDW_PM`, `B*_M`, and `BL2`,
+  but not stable `B`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: current blocker is the SDMA completion signal update interacting
+  with Ruby/GPU_VIPER directory state, not evidence that the H2D/D2H payload
+  copy decode is wrong.
+- Accepted: adding more application-level wait time will not resolve this run;
+  the simulator aborts on a protocol transition.
+- Rejected: this is a native HIP path bypassing the preload wrapper.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, SDMA trace, stats, generated Ruby
+  transition code, and address mappings.
+- No build or simulation was run by Codex.
+
+Single next diagnostic step: inspect the SDMA atomic request path and decide
+whether SE SDMA completion-signal atomics should bypass Ruby timing coherence
+with a functional host-visible signal update, or whether GPU_VIPER needs a
+valid response transition for this DMA atomic response case.
+
+## 2026-07-01 HIP API memcpy preload run hits Ruby directory transition
+
+The user ran the preload `hipMemcpy` H2D/D2H smoke in:
+
+`m5out-hip-api-memcpy-preload`
+
+and asked Codex to inspect the trace.
+
+Commands run by Codex:
+
+```bash
+git status --short
+find m5out-hip-api-memcpy-preload -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+tail -120 m5out-hip-api-memcpy-preload/simout.txt
+tail -180 m5out-hip-api-memcpy-preload/simerr.txt
+rg -n "HIP_MEMCPY_PRELOAD|HIP memcpy|panic|Invalid transition|addr: 0x1346e80|SESDMA|SDMA|CREATE_QUEUE|queue_type|doorbell route|registered_sdma|hsa_amd_memory_async_copy|async|MapMemory|RegisterMemory|Unmap|processPkt|HSA AQL|Dispatching|MemData|addr 0x1346e80|0x1346e80" m5out-hip-api-memcpy-preload/simout.txt m5out-hip-api-memcpy-preload/simerr.txt m5out-hip-api-memcpy-preload/hip-api-memcpy-preload.trace
+rg -n "Begin Simulation Statistics|End Simulation Statistics|simTicks|finalTick|hostSeconds|simInsts|simOps" m5out-hip-api-memcpy-preload/stats.txt
+tail -120 m5out-hip-api-memcpy-preload/hip-api-memcpy-preload.trace
+rg -n "opcode|SDMA_OP|case .*0x1|COPY|copy|POLL_REGMEM|ATOMIC|MemData|send|Dma|dma" src/dev/hsa/se_sdma_engine.* src -g"*se_sdma*"
+sed -n '1,280p' src/dev/hsa/se_sdma_engine.cc
+rg -n "0x1346e80|1346e80|0x7ffdeee7ae88|0x7ffde2c40000|0x7ffde2d00000|0x7ffdee800000|0x7ffdeee7" m5out-hip-api-memcpy-preload/config.ini m5out-hip-api-memcpy-preload/config.json m5out-hip-api-memcpy-preload/simerr.txt m5out-hip-api-memcpy-preload/hip-api-memcpy-preload.trace
+```
+
+First relevant result:
+
+```text
+Global frequency set at 1000000000000 ticks per second
+GPU Blit Kernel Completed dump and reset
+...
+build/VEGA_X86/mem/ruby/protocol/GPU_VIPER/Directory_Transitions.cc:1137: panic: Invalid transition
+board.cache_hierarchy.ruby_system.directory_controllers0 time: 141621864 addr: 0x1346e80 event: MemData state: B
+Program aborted at tick 47160080712
+```
+
+Key trace evidence:
+
+```text
+47126876949: ... AMDKFD_IOC_CREATE_QUEUE request gpu_id 22124 queue_type 1 ...
+47126876949: board.gpus0.gpu_cmd_proc.hsapp: registerSDMAQueue queue_id 2 ring_base 0x7ffde2d00000 ...
+47126876949: ... assigned queue_id 2 queue_type 1 backend sdma ...
+47148760044: ... doorbell route queue_id 2 to SESDMAEngine
+47148861277: board.gpus0.se_sdma_engine: SDMA queue 2 header 0x8 opcode 0x8 sub_opcode 0
+47148895243: board.gpus0.se_sdma_engine: SDMA POLL_REGMEM ... consuming packet
+47149023448: board.gpus0.se_sdma_engine: SDMA queue 2 header 0x1 opcode 0x1 sub_opcode 0
+47149423714: board.gpus0.se_sdma_engine: SDMA queue 2 header 0x5e00000a opcode 0xa sub_opcode 0
+47149492312: board.gpus0.se_sdma_engine: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ae88 old 0x1 src 0xffffffffffffffff new 0
+47159544582: ... doorbell route queue_id 2 to SESDMAEngine
+47159994133: board.gpus0.se_sdma_engine: SDMA atomic queue 2 op 0x2f addr 0x7ffdeee7ae88 ...
+47160028099: board.gpus0.se_sdma_engine: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ae88 old 0x1 src 0xffffffffffffffff new 0
+```
+
+Address mapping evidence:
+
+```text
+43831273851: Mapping VA 0x7ffdeee7a000 to framebuffer PA 0x1346000 size 4096
+...
+panic addr: 0x1346e80
+SDMA atomic signal addr: 0x7ffdeee7ae88
+```
+
+Facts confirmed:
+
+- The run did not print `HIP_MEMCPY_PRELOAD_PASSED`.
+- The run aborted with a GPU_VIPER directory invalid transition, not a user
+  mismatch message.
+- The interposed `hipMemcpy` path did create an SDMA queue:
+  queue ID 2, `queue_type 1`, backend `sdma`, GPU0 / `gpu_id 22124`.
+- The SDMA doorbells were routed to `SESDMAEngine`; `sdma_hit 1` appears for
+  the queue.
+- The first SDMA ring packet sequence includes:
+  - `POLL_REGMEM` HDP-flush/register poll consumed by the SE SDMA model;
+  - `COPY` opcode 1;
+  - `ATOMIC` opcode 0xa completion signal decrement.
+- The first ring dump decodes as a 1024-byte H2D copy:
+  - count dword `0x000003ff` means 1024 bytes under the current copy decoder;
+  - source dwords form host stack address `0x7fffffffe310`;
+  - destination dwords form device allocation `0x7ffdee800000`.
+- The second doorbell reaches the same SDMA queue and again performs the
+  completion-signal atomic decrement immediately before the panic.
+- The panic physical address `0x1346e80` maps into the allocation whose VA base
+  is `0x7ffdeee7a000`; this is the signal/control allocation region, not the
+  device buffer allocation at `0x7ffdee800000`.
+- The SDMA atomic target `0x7ffdeee7ae88` is consistent with that same signal
+  page after VA-to-PA translation.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the preload `hipMemcpy` wrapper reaches the SDMA path and submits
+  real SDMA work.
+- Accepted: the failure is currently a Ruby/GPU_VIPER protocol transition on
+  the SDMA completion signal path, not proof that the copied payload data was
+  incorrect.
+- Accepted: H2D appears to get as far as SDMA copy plus completion-signal
+  atomic. The second doorbell, likely the D2H copy path, reaches SDMA and
+  panics around the same completion-signal atomic.
+- Rejected: the failure is caused by native ROCm `hipMemcpy` bypassing the
+  preload wrapper. The trace shows SDMA queue routing through `SESDMAEngine`.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, SDMA trace, stats, and the
+  `SESDMAEngine` implementation.
+- No source code change, build, or additional simulation was run by Codex in
+  this step.
+
+Single next diagnostic step: decide whether to fix this at the SDMA completion
+signal path or at the Ruby/GPU_VIPER protocol transition. The smallest
+diagnostic is to rerun with Ruby/GPU_VIPER protocol debug flags around
+`addr 0x1346e80` and/or instrument `SESDMAEngine::executeAtomicData` to record
+the physical target and request type before the invalid `MemData` transition.
+
+## 2026-07-01 HIP API memcpy preload wrapper implementation
+
+The user asked Codex to execute the next step after adding the standalone
+`hipMemcpy` preload smoke. Codex executed Task 4 from the HIP/ROCm API plan:
+implement a narrow `hipMemcpy` interposer in `se_hip_compat`.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,260p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/executing-plans/SKILL.md
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/test-driven-development/SKILL.md
+git status --short
+sed -n '408,570p' docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md
+sed -n '1,360p' tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_compat.cpp
+sed -n '680,760p' tests/pyunit/stdlib/test_se_viper_multigpu.py
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_se_hip_memcpy_compatibility_layer_contract
+rg -n "hsa_amd_memory_async_copy|hsa_ext_amd" tests src -g"*.cc" -g"*.cpp" -g"*.h" -g"*.hh" | head -120
+sed -n '300,430p' tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_compat.cpp
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_se_hip_memcpy_compatibility_layer_contract
+make -C tests/test-progs/gpu/hip-api-smoke/se_hip_compat ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+nm -D tests/test-progs/gpu/hip-api-smoke/se_hip_compat/libse_hip_compat.so | rg "hipMemcpy|hipMemset"
+git diff --check
+```
+
+First relevant result:
+
+- RED failed as expected:
+  `AssertionError: 'hipMemcpy(void *dst' not found`.
+- GREEN passed after implementation:
+  `Ran 1 test ... OK`.
+- The rebuilt preload library exports both symbols:
+  `hipMemcpy` and `hipMemset`.
+
+Facts confirmed:
+
+- `se_hip_compat.cpp` now includes `hsa/hsa_ext_amd.h`.
+- The wrapper defines a real fallback function pointer:
+  `RealHipMemcpy`.
+- `asyncCopyAndWait()` uses:
+  - `hsa_signal_create`;
+  - `hsa_amd_memory_async_copy`;
+  - `hsa_signal_wait_scacquire`;
+  - `hsa_signal_destroy`.
+- The exported `hipMemcpy` handles:
+  - zero-size copies as success;
+  - null pointers as `hipErrorInvalidValue`;
+  - `hipMemcpyHostToHost` with `std::memcpy`;
+  - `hipMemcpyHostToDevice`, `hipMemcpyDeviceToHost`, and
+    `hipMemcpyDeviceToDevice` through `asyncCopyAndWait`;
+  - other kinds through `RTLD_NEXT` fallback.
+- The wrapper still requires the existing initialization path, including
+  `SE_HIP_MEMSET_HSACO`, because the compatibility library currently shares
+  initialization with the precompiled memset kernel.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the narrow `hipMemcpy` preload wrapper is built and ready for a
+  full SE smoke run.
+- Rejected: this local build proves runtime behavior. The next full simulation
+  must confirm that ROCr/gem5 accepts the `hsa_amd_memory_async_copy` calls
+  made from the interposer for H2D and D2H.
+
+Files changed:
+
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- `tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_compat.cpp`
+- this status document.
+
+Verification completed:
+
+- TDD RED focused pyunit failed for the missing `hipMemcpy` wrapper.
+- Focused pyunit passed after implementation.
+- `make -C tests/test-progs/gpu/hip-api-smoke/se_hip_compat ...` passed,
+  with ROCm header warnings only.
+- `nm -D ... | rg "hipMemcpy|hipMemset"` passed.
+- `git diff --check` passed.
+- Codex did not start the full gem5 simulation in this step.
+
+Single next diagnostic step: run the preload `hipMemcpy` H2D/D2H smoke:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hip-api-memcpy-preload -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp --debug-file=hip-api-memcpy-preload.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/hip-api-smoke/hip_memcpy_preload_smoke --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_PRELOAD=/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke/se_hip_compat/libse_hip_compat.so --env SE_HIP_MEMSET_HSACO=/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_memset.hsaco --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Expected result:
+
+```text
+HIP_MEMCPY_PRELOAD_PASSED
+```
+
+## 2026-07-01 HIP API memcpy preload smoke implementation
+
+The user asked Codex to execute the next step after the preload `hipMemset`
+baseline passed. Codex executed Task 3 from the HIP/ROCm API compatibility
+plan: add a standalone `hipMemcpy` preload smoke for H2D/D2H.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,260p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/executing-plans/SKILL.md
+sed -n '1,260p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/test-driven-development/SKILL.md
+git status --short
+sed -n '255,407p' docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_memcpy_preload_smoke_contract
+sed -n '1,90p' tests/test-progs/gpu/hip-api-smoke/Makefile
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_memcpy_preload_smoke_contract
+make -C tests/test-progs/gpu/hip-api-smoke hip_memcpy_preload_smoke ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_memcpy_preload_smoke_contract
+make -C tests/test-progs/gpu/hip-api-smoke hip_memcpy_preload_smoke ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc
+strings tests/test-progs/gpu/hip-api-smoke/hip_memcpy_preload_smoke | rg "HIP_MEMCPY_PRELOAD_PASSED|HIP memcpy preload smoke failed|HIP memcpy mismatch"
+git diff --check
+```
+
+First relevant result:
+
+- RED failed as expected with:
+  `FileNotFoundError: ... hip_memcpy_preload_smoke.hip`.
+- After implementation, the first GREEN attempt failed because the structural
+  test expected the exact substring `hipMemcpy(device_data, input`, while the
+  call was split across lines.
+- After making the H2D/D2H `hipMemcpy` calls single-line, GREEN passed:
+  `Ran 1 test ... OK`.
+
+Facts confirmed:
+
+- `tests/test-progs/gpu/hip-api-smoke/hip_memcpy_preload_smoke.hip` now exists.
+- The smoke performs:
+  - `hipSetDevice(0)`;
+  - `hipMalloc`;
+  - `hipMemcpy(device_data, input, ..., hipMemcpyHostToDevice)`;
+  - `hipMemcpy(output, device_data, ..., hipMemcpyDeviceToHost)`;
+  - CPU-side output verification;
+  - `HIP_MEMCPY_PRELOAD_PASSED`;
+  - `m5_exit(0)`.
+- The smoke intentionally does not call `hipFree`, keeping `hipFree` outside
+  this API stage.
+- The top-level hip-api-smoke Makefile now builds
+  `hip_memcpy_preload_smoke`.
+- The binary builds successfully and contains the expected pass/failure
+  markers.
+
+Hypotheses accepted or rejected:
+
+- Accepted: a standalone H2D/D2H HIP memcpy smoke is ready for the wrapper
+  implementation stage.
+- Rejected: this Task 3 step validates `hipMemcpy` preload behavior in gem5.
+  It only adds and builds the smoke; Task 4 must implement the actual
+  `hipMemcpy` interposer before a full SE run is meaningful.
+
+Files changed:
+
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- `tests/test-progs/gpu/hip-api-smoke/Makefile`
+- `tests/test-progs/gpu/hip-api-smoke/hip_memcpy_preload_smoke.hip`
+- this status document.
+
+Verification completed:
+
+- TDD RED focused pyunit failed for the missing smoke source.
+- Focused pyunit passed after implementation.
+- `make -C tests/test-progs/gpu/hip-api-smoke hip_memcpy_preload_smoke ...`
+  passed.
+- `strings ... | rg "HIP_MEMCPY_PRELOAD_PASSED|..."` passed.
+- `git diff --check` passed.
+- No full gem5 simulation was run by Codex in this step.
+
+Single next diagnostic step: execute Task 4 from the HIP/ROCm API plan:
+implement the narrow `hipMemcpy` preload wrapper using
+`hsa_amd_memory_async_copy`, then ask the user to run
+`m5out-hip-api-memcpy-preload`.
+
+## 2026-07-01 HIP API memset preload baseline passes
+
+The user ran the preload `hipMemset` baseline in:
+
+`m5out-hip-api-memset-preload`
+
+and asked Codex to inspect the trace.
+
+Commands run by Codex:
+
+```bash
+git status --short
+find m5out-hip-api-memset-preload -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+rg -n "HIP_MEMSET_PRELOAD|se_hip_compat|hipMemset|HIP memset|panic|fatal|assert|Page fault|simulate\\(\\) limit|user interrupt|Exiting|HSA AQL Kernel Complete|SESDMA|doorbell|processPkt|Dispatching|failed|error" m5out-hip-api-memset-preload
+tail -160 m5out-hip-api-memset-preload/simout.txt
+tail -180 m5out-hip-api-memset-preload/simerr.txt
+rg -n "CREATE_QUEUE|assigned queue_id|queue_type|backend|doorbell route|processPkt: submitting|setting barrier|Dispatching a workgroup|HSA AQL Kernel Complete|kernel [01] failed|pending invalidate|notify WgCompl|Blit Kernel" m5out-hip-api-memset-preload/hip-api-memset-preload.trace
+rg -n "panic|fatal|assert|Page fault|Invalid transition|FAILED|mismatch|setup failed|simulate\\(\\) limit|user interrupt|HIP_MEMSET_PRELOAD_PASSED|Exiting" m5out-hip-api-memset-preload/simout.txt m5out-hip-api-memset-preload/simerr.txt m5out-hip-api-memset-preload/hip-api-memset-preload.trace
+rg -n "Begin Simulation Statistics|End Simulation Statistics|simTicks|finalTick|hostSeconds|simInsts|simOps" m5out-hip-api-memset-preload/stats.txt
+```
+
+First relevant result:
+
+```text
+GPU Blit Kernel Completed dump and reset
+GPU Blit Kernel Completed dump and reset
+HIP_MEMSET_PRELOAD_PASSED
+Exiting @ tick 45918208161 because m5_exit instruction encountered.
+```
+
+Key trace evidence:
+
+```text
+45847823616: ... AMDKFD_IOC_CREATE_QUEUE assigned queue_id 1 queue_type 2 backend compute ... gpu_id 22124 ...
+45882430974: board.gpus0.gpu_cmd_proc.hsapp: doorbell route queue_id 1 to HWScheduler
+45886864608: board.gpus0.gpu_cmd_proc.hsapp: processPkt: submitting kernel dispatch pkt active list ID = 1
+45887087314: board.gpus0: Dispatching a workgroup to CU 0: WG 0
+45887087314: board.gpus0: Dispatching a workgroup to CU 1: WG 1
+45887087314: board.gpus0: Dispatching a workgroup to CU 2: WG 2
+45887087314: board.gpus0: Dispatching a workgroup to CU 3: WG 3
+45888958773: board.gpus0.dispatcher: HSA AQL Kernel Complete with completion signal! Addr: 140728611613568
+```
+
+Facts confirmed:
+
+- The run used the expected environment:
+  - `LD_PRELOAD=.../se_hip_compat/libse_hip_compat.so`;
+  - `SE_HIP_MEMSET_HSACO=.../se_hip_memset.hsaco`;
+  - `HSA_ENABLE_SDMA=1`.
+- The application printed `HIP_MEMSET_PRELOAD_PASSED`.
+- The run exited via `m5_exit` rather than max-tick or user interrupt.
+- The final preload `hipMemset` dispatch used GPU0 / `gpu_id 22124`, queue
+  ID 1, compute queue type 2, and completed through an HSA AQL completion
+  signal.
+- Four workgroups were dispatched for the preload memset kernel.
+- The earlier queue ID 0 kernel completed before the preload memset queue; it
+  corresponds to runtime/internal setup activity and is not a failure.
+- `kernel ... failed to launch, due to pending invalidate requests` appears as
+  the existing retry path before dispatch; the kernel later dispatches and
+  completes.
+- No panic, fatal, assertion, page fault, invalid transition, explicit mismatch,
+  setup failure, max-tick exit, or user interrupt was found.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the precompiled-HSACO `LD_PRELOAD` path provides a working
+  synchronous `hipMemset` baseline in SE mode.
+- Accepted: this validates the compatibility wrapper path, not native ROCclr
+  `hipMemset`.
+- Rejected: the trace indicates an SDMA packet path for `hipMemset`; the actual
+  preload baseline uses an HSA compute kernel dispatch.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of `simout.txt`, `simerr.txt`,
+  `hip-api-memset-preload.trace`, and `stats.txt`.
+- No source code change, build, or additional simulation was run by Codex in
+  this step.
+
+Single next diagnostic step: proceed to Task 3 from the HIP/ROCm API plan:
+add a standalone `hipMemcpy` preload smoke for H2D/D2H before implementing the
+`hipMemcpy` preload wrapper.
+
+## 2026-07-01 HIP API memset preload baseline preparation
+
+The user asked Codex to execute the next HIP/ROCm API compatibility step after
+native `hipMalloc` passed on device0 and device1. Codex executed Task 2
+preparation from the HIP/ROCm API plan, stopping before the user-owned full
+gem5 simulation.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/systematic-debugging/SKILL.md
+sed -n '1,260p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/executing-plans/SKILL.md
+git status --short
+rg -n "Task 2|hipMemset|preload|LD_PRELOAD|hip_memset_preload" docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md docs/debug/se-multigpu-status.md | head -220
+sed -n '189,254p' docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md
+sed -n '620,720p' tests/pyunit/stdlib/test_se_viper_multigpu.py
+sed -n '1,220p' tests/test-progs/gpu/hip-api-smoke/hip_memset_preload_smoke.hip
+sed -n '1,260p' tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_compat.cpp
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_se_hip_memset_compatibility_layer_contract
+make -C tests/test-progs/gpu/hip-api-smoke/se_hip_compat ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+make -C tests/test-progs/gpu/hip-api-smoke hip_memset_preload_smoke ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc
+nm -D tests/test-progs/gpu/hip-api-smoke/se_hip_compat/libse_hip_compat.so | rg "hipMemset"
+strings tests/test-progs/gpu/hip-api-smoke/hip_memset_preload_smoke | rg "HIP_MEMSET_PRELOAD_PASSED|HIP memset setup failed|HIP memset mismatch"
+stat tests/test-progs/gpu/hip-api-smoke/se_hip_compat/libse_hip_compat.so tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_memset.hsaco tests/test-progs/gpu/hip-api-smoke/hip_memset_preload_smoke
+git diff --check
+```
+
+First relevant result:
+
+```text
+Ran 1 test in 0.000s
+OK
+0000000000002830 T hipMemset
+HIP_MEMSET_PRELOAD_PASSED
+```
+
+Facts confirmed:
+
+- `test_se_hip_memset_compatibility_layer_contract` now also covers the
+  standalone preload smoke requirements:
+  - `HIP_MEMSET_PRELOAD_PASSED`;
+  - `volatile const unsigned char *observed`;
+  - `m5_exit(0)`;
+  - no `hipMemcpy`.
+- The compatibility library target is present and exports `hipMemset`.
+- The standalone preload smoke binary is present and contains the expected
+  pass/failure markers.
+- `make` found both compatibility artifacts and the smoke binary up to date.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the `hipMemset` preload baseline is ready for a fresh full SE run.
+- Rejected: native unmodified ROCclr `hipMemset` should be retried as this
+  next step. Prior evidence already showed it does not complete in usable time;
+  this stage deliberately validates the precompiled HSACO preload path.
+
+Files changed:
+
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- Focused pyunit passed.
+- `make -C tests/test-progs/gpu/hip-api-smoke/se_hip_compat ...` passed.
+- `make -C tests/test-progs/gpu/hip-api-smoke hip_memset_preload_smoke ...`
+  passed.
+- `nm -D ... | rg "hipMemset"` passed.
+- `strings ... | rg "HIP_MEMSET_PRELOAD_PASSED|..."` passed.
+- `git diff --check` passed.
+- Codex did not start the full gem5 simulation in this step because
+  AGENTS.md records full simulations as user-owned unless explicitly
+  delegated.
+
+Single next diagnostic step: run the preload `hipMemset` baseline:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hip-api-memset-preload -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp --debug-file=hip-api-memset-preload.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/hip-api-smoke/hip_memset_preload_smoke --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_PRELOAD=/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke/se_hip_compat/libse_hip_compat.so --env SE_HIP_MEMSET_HSACO=/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_memset.hsaco --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+Expected result:
+
+```text
+HIP_MEMSET_PRELOAD_PASSED
+```
+
+## 2026-07-01 HIP API malloc device1 trace inspection
+
+The user ran the native `hipMalloc` smoke with `--device 1` and asked whether
+the trace shows VRAM allocation on device1.
+
+Commands run by Codex:
+
+```bash
+git status --short
+tail -100 docs/debug/se-multigpu-status.md
+find m5out-hip-api-malloc-native-device1 -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+rg -n "HIP_API_MALLOC|hipSetDevice|hipMalloc|hsaKmtAllocMemory|hsaKmtMapMemoryToGPUNodes|hsaKmtQueryPointerInfo|GPURenderDriver::mmap|panic|fatal|assert|Page fault|simulate\\(\\) limit|user interrupt|Exiting" m5out-hip-api-malloc-native-device1/simout.txt m5out-hip-api-malloc-native-device1/simerr.txt
+rg -n "gpus|gpu|gpu_id|node|vram|memories|range|addr|AddrRange|memory_range|mem_range" m5out-hip-api-malloc-native-device1/config.ini | head -240
+sed -n '1,120p' m5out-hip-api-malloc-native-device1/simout.txt
+tail -160 m5out-hip-api-malloc-native-device1/simerr.txt
+rg -n "gpu_id|node_id|KFD|topology|hsaKmtAllocMemory|hsaKmtMapMemoryToGPUNodes|gpuvm|vm|aperture|gpu_mem|vram" src/gpu-compute src/dev configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py | head -260
+rg -n "22124|22125|566c|566d|gpu_id|node" m5out-hip-api-malloc-native-device1/config.ini m5out-hip-api-malloc-native-device1/config.json m5out-hip-api-malloc-native-device1/simerr.txt | head -260
+rg -n "0x7ffdee800000|7ffdee800000|0x7ffdeeb00000|0x7ffdef100000|0x7ffdeed00000" m5out-hip-api-malloc-native-device1/config.ini m5out-hip-api-malloc-native-device1/config.json m5out-hip-api-malloc-native-device1/simerr.txt
+```
+
+First relevant result:
+
+```text
+HIP_API_MALLOC_PASSED device=1 ptr=0x7ffdee800000 bytes=1024
+[hsaKmtAllocMemory] node 2
+src/gpu-compute/gpu_render_driver.cc:73: warn: GPURenderDriver::mmap returning start address 0x7ffdee800000
+[hsaKmtMapMemoryToGPUNodes] address 0x7ffdee800000 number of nodes 1
+```
+
+Facts confirmed:
+
+- The run command contains `--opts=--device 1`.
+- The smoke completed and exited through `m5_exit`; no panic/fatal/assert/page
+  fault/max-tick/user-interrupt result was found.
+- The pass marker returned pointer `0x7ffdee800000`.
+- The final user allocation immediately before that pass marker is
+  `hsaKmtAllocMemory node 2`.
+- The multi-GPU config constructs GPUs with:
+  `gpu_id=22124 + gpu_index` and `vram_pool_id=gpu_index + 1`.
+  Therefore GPU0 maps to KFD/HSA node/pool 1 and GPU1 maps to node/pool 2.
+- `config.ini` confirms the instantiated IDs:
+  `board.gpus0 gpuId=22124`, `board.gpus1 gpuId=22125`, and driver
+  `gpuIds=22124 22125`.
+- `config.ini` confirms the physical VRAM ranges:
+  `board.gpu_memories0` range `4294967296:5368709120` and
+  `board.gpu_memories1` range `5368709120:6442450944`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: native `hipSetDevice(1) + hipMalloc` selects GPU1's HSA node/pool
+  in this SE multi-GPU setup.
+- Accepted: the returned user pointer is an SVM/GPUVM virtual address, not a
+  direct physical VRAM address; the evidence for device ownership is the KFD
+  node/pool selection and mapping call, not the virtual pointer value alone.
+- Rejected: the device1 run silently reused the device0 allocation path. The
+  final allocation uses node 2, whereas the device0 baseline used node 1.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of `simout.txt`, `simerr.txt`, `config.ini`,
+  `config.json`, and relevant config/source lines.
+- No source code change, build, or full simulation was run by Codex in this
+  step.
+
+Single next diagnostic step: mark native `hipMalloc` baseline as passed for
+device0 and device1, then proceed to the existing preload `hipMemset` baseline
+before adding `hipMemcpy` preload support.
+
+## 2026-07-01 resident-flag shader-store diagnostic spec/plan
+
+The user proposed a stricter resident-reader synchronization mechanism for the
+next shader-store coherence diagnostic:
+
+1. the writer GPU updates `value` using a shader store;
+2. the writer GPU then updates a synchronization `flag` from 0 to 1 using a
+   shader store;
+3. the reader GPU remains in the same kernel dispatch, spins on `flag`, and
+   rereads `value` after observing `flag == 1`.
+
+The user also clarified that `value` and `flag` may be in the same cache line,
+so the diagnostic should treat cache-line layout as an explicit test variable
+rather than requiring split-line placement.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,260p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/writing-plans/SKILL.md
+ls docs/superpowers/specs docs/superpowers/plans
+sed -n '1,140p' docs/superpowers/specs/2026-06-27-remote-write-after-cache-read-design.md
+sed -n '1,120p' docs/superpowers/plans/2026-06-27-remote-write-after-cache-read.md
+```
+
+First relevant result:
+
+- A new standalone diagnostic was specified instead of adding more modes to
+  `hsa_remote_cache_read`.
+
+Facts confirmed:
+
+- The new diagnostic should be a separate binary:
+  `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag`.
+- The new kernel bundle should be:
+  `tests/test-progs/gpu/xgmi-peer-vram/resident_flag_kernels.hip`.
+- The default strict sync mode uses writer-side `value -> fence -> flag` and a
+  reader-side strict fence after observing `flag`.
+- `same-line` and `split-line` layouts are both first-class variables.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the next useful diagnostic is not another SDMA same-dispatch run;
+  that path already observed updated after the `BDW_M + L3Hit` fix.
+- Accepted: a standalone program is clearer than adding another mode to the
+  already broad `hsa_remote_cache_read` binary.
+- Rejected: `value` and `flag` must always be on different cache lines. The
+  correct approach is to test both layouts.
+
+Files changed:
+
+- `docs/superpowers/specs/2026-07-01-hsa-remote-shader-resident-flag-design.md`
+- `docs/superpowers/plans/2026-07-01-hsa-remote-shader-resident-flag.md`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Documentation/specification only. No source implementation, build, or full
+  simulation was run in this step.
+
+Single next diagnostic step: if the design is accepted, implement the plan
+starting with the structural pyunit and new `resident_flag_kernels.hip` /
+`hsa_remote_shader_resident_flag.cpp` files.
+
+## 2026-07-01 resident-flag shader-store diagnostic implementation
+
+The user asked Codex to execute the resident-flag implementation plan. Codex
+implemented the standalone diagnostic without launching a full gem5 simulation.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_shader_resident_flag_smoke_is_standalone
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_shader_resident_flag ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+strings tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag | rg "RESIDENT_FLAG_RESULT|RESIDENT_FLAG_PASSED_UPDATED|RESIDENT_FLAG_OBSERVED_STALE_VALUE|RESIDENT_FLAG_FLAG_TIMEOUT|RESIDENT_FLAG_FAILED_UNEXPECTED"
+git diff --check
+```
+
+First relevant result:
+
+- The focused structural pyunit passed:
+  `test_remote_shader_resident_flag_smoke_is_standalone ... OK`.
+- The new binary and HSACO built successfully:
+  `hsa_remote_shader_resident_flag`,
+  `resident_flag_kernels.bundle`, and `resident_flag_kernels.hsaco`.
+
+Facts confirmed:
+
+- `resident_flag_kernels.hip` defines:
+  - `resident_flag_reader`;
+  - `resident_flag_writer`;
+  - strict/writer-fence-only/no-fence sync-mode support.
+- `hsa_remote_shader_resident_flag.cpp` supports:
+  - `--reverse`;
+  - `--layout same-line|split-line`;
+  - `--sync strict|writer-fence-only|no-fence`;
+  - `--spin-limit N`.
+- The writer kernel stores `value` before `flag`.
+- The reader kernel stays in one dispatch, reads `value`, spins on the
+  GPU-written `flag`, then rereads `value`.
+- The standalone binary contains all expected `RESIDENT_FLAG_*` result
+  markers.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the standalone implementation can be built without extending the
+  mode set of `hsa_remote_cache_read`.
+- Accepted: the first implemented version keeps strict synchronization as the
+  default while preserving weaker sync modes for later controls.
+- Not tested yet: full Timing behavior for forward/reverse and
+  same-line/split-line layouts.
+
+Files changed:
+
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- `tests/test-progs/gpu/xgmi-peer-vram/Makefile`
+- `tests/test-progs/gpu/xgmi-peer-vram/resident_flag_kernels.hip`
+- `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag.cpp`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Focused structural pyunit passed.
+- New binary/HSACO build passed.
+- Result marker string check passed.
+- `git diff --check` passed.
+- Full `test_se_viper_multigpu` was attempted but has one unrelated existing
+  failure in `test_kfd_normal_operations_use_debug_tracing`: it expects
+  `AMDKFD_IOC_CREATE_QUEUE gpu_id`, while current source prints
+  `AMDKFD_IOC_CREATE_QUEUE request gpu_id`.
+
+Single next diagnostic step: the user should run the first full Timing smoke:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-shader-resident-flag-forward-same-strict -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,GPUDisp,GPUAgentDisp --debug-file=resident-flag.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag '--opts=--layout same-line --sync strict' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu \
+  --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-07-01 resident-flag forward same-line strict abort
+
+The user ran the first full Timing smoke and reported an abort in
+`m5out-hsa-remote-shader-resident-flag-forward-same-strict`.
+
+Commands run by Codex:
+
+```bash
+ls -lh m5out-hsa-remote-shader-resident-flag-forward-same-strict
+tail -160 m5out-hsa-remote-shader-resident-flag-forward-same-strict/simout.txt
+tail -200 m5out-hsa-remote-shader-resident-flag-forward-same-strict/simerr.txt
+rg -n "RESIDENT_FLAG|resident_flag|panic|fatal|assert|Abort|aborted|Invalid transition|Page fault|hsa_|kernel|doorbell|processPkt|AQL|Complete|failed|error" m5out-hsa-remote-shader-resident-flag-forward-same-strict/simout.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict/simerr.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict/resident-flag.trace
+sed -n '320,540p' m5out-hsa-remote-shader-resident-flag-forward-same-strict/resident-flag.trace
+```
+
+First relevant result:
+
+- The program aborted while waiting for the initialization copy:
+  `[hsa_remote_shader_resident_flag] wait H2D_GPU1_INITIAL completion`.
+- The first gem5 assertion was:
+  `GPUComputeDriver::setMtype(...): Assertion vma != gpuVmaInfo.end() failed`.
+
+Facts confirmed:
+
+- The recorded command did not include `--env HSA_ENABLE_SDMA=1`.
+- `resident-flag.trace` shows ROCr submitted a compute `Blit kernel` on GPU1
+  for the `H2D_GPU1_INITIAL` copy.
+- The abort occurs before the resident reader or writer diagnostic kernels
+  are launched.
+- The failing path is the ROCr GPU blit-kernel initialization copy accessing
+  an address that is not registered in gem5's GPU VMA metadata, not the new
+  resident-flag coherence logic.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the immediate abort is caused by running without
+  `HSA_ENABLE_SDMA=1`, which lets ROCr choose the compute blit path for the
+  H2D initialization copy.
+- Rejected: this trace proves a failure of the resident reader/writer shader
+  synchronization test. The test did not reach that phase.
+
+Files changed:
+
+- `docs/debug/se-multigpu-status.md`
+- `docs/superpowers/plans/2026-07-01-hsa-remote-shader-resident-flag.md`
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, and `resident-flag.trace`.
+- The run command in the implementation plan/status handoff was corrected to
+  include `--env HSA_ENABLE_SDMA=1`.
+
+Single next diagnostic step: rerun the same forward same-line strict test with
+`--env HSA_ENABLE_SDMA=1`, and include `SESDMAEngine` in debug flags if SDMA
+packet confirmation is needed:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-shader-resident-flag-forward-same-strict -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp --debug-file=resident-flag.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag '--opts=--layout same-line --sync strict' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-07-01 resident-flag forward same-line strict rerun stalls at reader
+
+The user reran the forward same-line strict diagnostic in the same output
+directory with `--env HSA_ENABLE_SDMA=1` and reported that it appeared stuck.
+
+Commands run by Codex:
+
+```bash
+stat m5out-hsa-remote-shader-resident-flag-forward-same-strict/simout.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict/simerr.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict/resident-flag.trace m5out-hsa-remote-shader-resident-flag-forward-same-strict/stats.txt
+ps -C gem5.opt -o pid,etime,time,pcpu,stat,args
+tail -180 m5out-hsa-remote-shader-resident-flag-forward-same-strict/simout.txt
+tail -120 m5out-hsa-remote-shader-resident-flag-forward-same-strict/simerr.txt
+rg -n "RESIDENT_FLAG|resident_flag|first_read_done|reader_done|wait resident flag|completion|H2D_GPU1_INITIAL|doorbell route|SESDMA|Blit kernel|HSA AQL Kernel Complete|notify WgCompl|panic|fatal|assert|Exiting|simulate\\(\\) limit" m5out-hsa-remote-shader-resident-flag-forward-same-strict/simout.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict/simerr.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict/resident-flag.trace
+tail -100 m5out-hsa-remote-shader-resident-flag-forward-same-strict/stats.txt
+```
+
+First relevant result:
+
+- `ps -C gem5.opt` showed no currently running `gem5.opt` process at the time
+  of inspection.
+- The run command in `simout.txt` includes `--env HSA_ENABLE_SDMA=1`.
+- The last useful host-side progress is:
+  `resident flag writer completion: HSA_STATUS_SUCCESS`.
+- No `RESIDENT_FLAG_RESULT` line was printed.
+
+Facts confirmed:
+
+- The initialization copy no longer aborts. It completes with:
+  `wait completion: HSA_STATUS_SUCCESS`.
+- The reader dispatch is launched on GPU1.
+- The host observes `first_read_done=1`, so the reader kernel did start and
+  performed its first read before spinning on `flag`.
+- The writer dispatch is launched on GPU0 and completes successfully.
+- The trace contains an HSA AQL completion for the writer queue after
+  `notify WgCompl 0`.
+- There is no matching final reader completion/result in the inspected output.
+- The current binary default `--spin-limit` is large (`100000000`), so a
+  non-observed flag can look like a hang under Timing CPU simulation.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the previous initialization-copy abort was fixed by enabling SDMA.
+- Accepted: the current stall is after writer completion, while waiting for
+  the resident reader to set `control->reader_done`.
+- Current leading hypothesis: the resident GPU1 reader is spinning because it
+  does not observe the GPU0 shader-store update to `flag`.
+- Not yet proven: whether the GPU0 remote store failed to reach GPU1 VRAM, or
+  reached memory but did not invalidate/update GPU1's cached polling line.
+
+Files changed:
+
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Read-only inspection of `simout.txt`, `simerr.txt`, `resident-flag.trace`,
+  `stats.txt`, and current process state.
+- No source code change or full rerun was performed by Codex in this step.
+
+Single next diagnostic step: rerun the same case with a much smaller
+`--spin-limit`, so the resident reader reports a bounded
+`RESIDENT_FLAG_FLAG_TIMEOUT` instead of appearing hung:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp --debug-file=resident-flag.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag '--opts=--layout same-line --sync strict --spin-limit 1000000' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-07-01 resident-flag stats after user interrupt
+
+The user terminated the forward same-line strict rerun and asked whether the
+new `stats.txt` helps locate the issue.
+
+Commands run by Codex:
+
+```bash
+stat m5out-hsa-remote-shader-resident-flag-forward-same-strict/stats.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict/simout.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict/simerr.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict/resident-flag.trace
+rg -n "Begin Simulation Statistics|End Simulation Statistics|simTicks|finalTick|Exiting" m5out-hsa-remote-shader-resident-flag-forward-same-strict/stats.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict/simout.txt
+awk '/Begin Simulation Statistics/{blk++} /simTicks|finalTick|hostSeconds|simInsts|simOps/{print "block=" blk, NR ":" $0}' m5out-hsa-remote-shader-resident-flag-forward-same-strict/stats.txt
+awk 'NR>=72612 && $1 ~ /^board\\.gpus[01]\\.CUs[0-9]+\\.(numInstrExecuted|completedWfs|completedWGs|globalReads|globalWrites|flatVMemInsts|scalarMemReads|vALUInsts|sALUInsts|totalCycles|tlbRequests)$/ {split($1,a,"."); key=a[2] "." a[4]; sum[key]+=$2} END {for (k in sum) print k, sum[k]}' m5out-hsa-remote-shader-resident-flag-forward-same-strict/stats.txt
+sed -n '1,220p' tests/test-progs/gpu/xgmi-peer-vram/resident_flag_kernels.hip
+```
+
+First relevant result:
+
+- `simout.txt` ends with:
+  `Exiting @ tick 44288070597 because user interrupt received.`
+- `stats.txt` has four statistic dumps; the final dump starts at line 72612
+  and corresponds to final tick `44288070597`.
+
+Facts confirmed:
+
+- In the final post-writer interval, GPU0 executed no additional CU work:
+  `gpus0.numInstrExecuted 0`, `gpus0.globalReads 0`,
+  `gpus0.globalWrites 0`.
+- In the same final interval, GPU1 executed only one long-running wavefront:
+  `gpus1.numInstrExecuted 16136245`,
+  `gpus1.sALUInsts 8068123`,
+  `gpus1.vALUInsts 4034061`,
+  `gpus1.totalCycles 60510919`.
+- In that final interval, GPU1 issued no global/flat memory operations:
+  `gpus1.globalReads 0`, `gpus1.globalWrites 0`,
+  `gpus1.flatVMemInsts 0`, `gpus1.tlbRequests 0`.
+- The reader kernel source currently declares `target` as
+  `const uint32_t *target`, and the polling loop reads
+  `flag = target[flag_dword];`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the final apparent hang is not a Ruby/protocol deadlock with
+  outstanding memory requests. The final interval has no GPU1 memory requests.
+- Accepted: the resident reader is executing a pure ALU loop after the first
+  read.
+- Leading hypothesis: because `target` is not volatile, the compiler can keep
+  the polled flag value in a register or otherwise avoid reissuing the
+  `target[flag_dword]` global load in the loop. This makes the current smoke
+  invalid for coherence visibility.
+- Not yet tested: rebuilding with volatile/acquire-style polling and rerunning
+  the same case.
+
+Files changed:
+
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Read-only inspection of the final stats block, stdout/stderr, trace, and
+  current kernel source.
+- Attempted `llvm-objdump -d resident_flag_kernels.hsaco`, but ROCm 4.0.1's
+  tool aborted with `LLVM ERROR: Disassembly not yet supported for subtarget`.
+
+Single next diagnostic step: update the resident reader polling path so the
+flag load is a real repeated memory operation, for example by making the
+reader `target` pointer volatile or by using an explicit volatile/acquire load,
+then rebuild `resident_flag_kernels.hsaco` and rerun the short-spin case.
+
+## 2026-07-01 resident-flag volatile polling fix
+
+The user asked Codex to execute the next step after the stats showed that the
+resident reader was spinning without issuing repeated global memory loads.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_shader_resident_flag_smoke_is_standalone
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_shader_resident_flag ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+stat tests/test-progs/gpu/xgmi-peer-vram/resident_flag_kernels.hsaco tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag
+git diff --check
+```
+
+First relevant result:
+
+- The new focused pyunit assertion first failed as expected because
+  `resident_flag_reader` still used `const uint32_t *target`.
+- After the kernel fix, the focused pyunit passed:
+  `Ran 1 test ... OK`.
+- The test program and HSACO rebuilt successfully.
+
+Facts confirmed:
+
+- `resident_flag_reader` now takes
+  `const volatile uint32_t *target`.
+- The polling statement remains `flag = target[flag_dword];`, but the pointer
+  type now prevents the compiler from treating the polled flag value as an
+  invariant non-volatile memory read.
+- Rebuilt generated artifacts:
+  `tests/test-progs/gpu/xgmi-peer-vram/resident_flag_kernels.bundle`,
+  `tests/test-progs/gpu/xgmi-peer-vram/resident_flag_kernels.hsaco`, and
+  `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the previous test binary was invalid for resident polling
+  visibility because the reader flag load was not forced to be repeated.
+- Not yet tested: whether the volatile-polling binary now produces
+  `RESIDENT_FLAG_PASSED_UPDATED`, `RESIDENT_FLAG_OBSERVED_STALE_VALUE`, or a
+  bounded `RESIDENT_FLAG_FLAG_TIMEOUT` in full Timing simulation.
+
+Files changed:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/resident_flag_kernels.hip`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- RED focused pyunit failed for the missing volatile reader target.
+- GREEN focused pyunit passed after the kernel change.
+- `make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_shader_resident_flag`
+  rebuilt the HSACO and binary successfully.
+- `git diff --check` passed.
+
+Single next diagnostic step: rerun the short-spin full Timing smoke with the
+rebuilt binary:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp --debug-file=resident-flag.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag '--opts=--layout same-line --sync strict --spin-limit 1000000' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-07-01 resident-flag volatile polling narrowed to flag only
+
+The user clarified that only the flag polling load should be volatile; the
+first and second `value` reads should remain ordinary loads.
+
+Commands run by Codex:
+
+```bash
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_remote_shader_resident_flag_smoke_is_standalone
+make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_shader_resident_flag ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc CXX=g++
+stat tests/test-progs/gpu/xgmi-peer-vram/resident_flag_kernels.hsaco tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag
+git diff --check
+```
+
+First relevant result:
+
+- The updated focused pyunit first failed against the broad volatile-pointer
+  implementation, as expected.
+- After narrowing the implementation, the focused pyunit passed:
+  `Ran 1 test ... OK`.
+- The test program and HSACO rebuilt successfully.
+
+Facts confirmed:
+
+- `resident_flag_reader` again takes `const uint32_t *target`.
+- Only the polling load is volatile:
+  `flag = volatile_load_u32(&target[flag_dword]);`.
+- `first = target[value_dword]` and `second = target[value_dword]` remain
+  ordinary loads.
+
+Hypotheses accepted or rejected:
+
+- Accepted: broad `const volatile uint32_t *target` was too strong for the
+  intended litmus because it also changed the value reads.
+- Accepted: the correct test semantics require volatile behavior only for
+  the synchronization flag polling.
+- Not yet tested: full Timing behavior with the narrowed volatile polling
+  HSACO.
+
+Files changed:
+
+- `tests/test-progs/gpu/xgmi-peer-vram/resident_flag_kernels.hip`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- RED focused pyunit failed for the broad volatile-pointer implementation.
+- GREEN focused pyunit passed after narrowing volatile to the flag polling
+  load.
+- `make -C tests/test-progs/gpu/xgmi-peer-vram hsa_remote_shader_resident_flag`
+  rebuilt `resident_flag_kernels.hsaco` and
+  `hsa_remote_shader_resident_flag`.
+- `git diff --check` passed.
+
+Single next diagnostic step: rerun the same short-spin full Timing smoke with
+the rebuilt narrowed-volatile binary:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp --debug-file=resident-flag.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag '--opts=--layout same-line --sync strict --spin-limit 1000000' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-07-01 resident-flag forward same-line strict short-spin passes
+
+The user reran the narrowed-volatile short-spin Timing smoke and asked Codex
+to inspect the trace.
+
+Commands run by Codex:
+
+```bash
+stat m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin/simout.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin/simerr.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin/resident-flag.trace m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin/stats.txt
+rg -n "RESIDENT_FLAG|resident_flag|first_read_done|reader_done|wait resident flag|completion|H2D_GPU1_INITIAL|doorbell route|SESDMA|Blit kernel|HSA AQL Kernel Complete|notify WgCompl|panic|fatal|assert|Exiting|simulate\\(\\) limit|user interrupt" m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin/simout.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin/simerr.txt m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin/resident-flag.trace
+tail -120 m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin/simout.txt
+awk '/Begin Simulation Statistics/{blk++} /simTicks|finalTick|hostSeconds|simInsts|simOps/{print "block=" blk, NR ":" $0}' m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin/stats.txt
+awk 'NR>=72630 && NR<96275 && $1 ~ /^board\\.gpus[01]\\.CUs[0-9]+\\.(numInstrExecuted|completedWfs|completedWGs|globalReads|globalWrites|flatVMemInsts|scalarMemReads|vALUInsts|sALUInsts|totalCycles|tlbRequests)$/ {split($1,a,"."); key=a[2] "." a[4]; sum[key]+=$2} END {for (k in sum) print k, sum[k]}' m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin/stats.txt
+```
+
+First relevant result:
+
+- The run completed via `m5_exit`:
+  `Exiting @ tick 24185841282 because m5_exit instruction encountered.`
+- The test printed:
+  `RESIDENT_FLAG_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- The narrowed volatile flag polling fixed the previous pure-ALU spin issue.
+- The reader observed the writer flag and completed:
+  `observed reader_done=1 after 0 host polls`.
+- The final result was:
+  `first=0x11112222 second=0x33334444 flag=1 spins=517 classification=1`.
+- The trace shows both writer and reader AQL completions:
+  - GPU0 writer completion at tick `24151265892`;
+  - GPU1 reader completion at tick `24152049108`.
+- The post-writer reader-completion stats block shows actual reader memory
+  activity:
+  - `gpus1.flatVMemInsts 3`;
+  - `gpus1.tlbRequests 3`;
+  - `gpus1.numInstrExecuted 37`;
+  - `gpus1.completedWGs 1`;
+  - `gpus1.completedWfs 1`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the earlier hang was a test-code issue caused by non-volatile flag
+  polling, not a protocol deadlock.
+- Accepted: in forward same-line strict mode, with repeated volatile flag
+  polling, the resident GPU1 reader observes GPU0's shader-store update and
+  then rereads the updated value.
+- Not yet tested: split-line layout, reverse direction, and weaker sync modes
+  with the corrected polling semantics.
+
+Files changed:
+
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and stats for
+  `m5out-hsa-remote-shader-resident-flag-forward-same-strict-shortspin`.
+- No source changes or full simulation rerun were performed by Codex in this
+  step.
+
+Single next diagnostic step: run the split-line strict forward control with
+the same corrected polling semantics to separate same-cache-line effects from
+cross-line visibility:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-shader-resident-flag-forward-split-strict-shortspin -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp --debug-file=resident-flag.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag '--opts=--layout split-line --sync strict --spin-limit 1000000' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-07-01 resident-flag forward split-line strict short-spin passes
+
+The user ran the split-line strict forward control and asked Codex to inspect
+the trace.
+
+Commands run by Codex:
+
+```bash
+stat m5out-hsa-remote-shader-resident-flag-forward-split-strict-shortspin/simout.txt m5out-hsa-remote-shader-resident-flag-forward-split-strict-shortspin/simerr.txt m5out-hsa-remote-shader-resident-flag-forward-split-strict-shortspin/resident-flag.trace m5out-hsa-remote-shader-resident-flag-forward-split-strict-shortspin/stats.txt
+rg -n "RESIDENT_FLAG|resident_flag|first_read_done|reader_done|wait resident flag|completion|H2D_GPU1_INITIAL|doorbell route|SESDMA|Blit kernel|HSA AQL Kernel Complete|notify WgCompl|panic|fatal|assert|Exiting|simulate\\(\\) limit|user interrupt" m5out-hsa-remote-shader-resident-flag-forward-split-strict-shortspin/simout.txt m5out-hsa-remote-shader-resident-flag-forward-split-strict-shortspin/simerr.txt m5out-hsa-remote-shader-resident-flag-forward-split-strict-shortspin/resident-flag.trace
+tail -120 m5out-hsa-remote-shader-resident-flag-forward-split-strict-shortspin/simout.txt
+awk '/Begin Simulation Statistics/{blk++} /simTicks|finalTick|hostSeconds|simInsts|simOps/{print "block=" blk, NR ":" $0}' m5out-hsa-remote-shader-resident-flag-forward-split-strict-shortspin/stats.txt
+awk 'NR>=72623 && NR<96305 && $1 ~ /^board\\.gpus[01]\\.CUs[0-9]+\\.(numInstrExecuted|completedWfs|completedWGs|globalReads|globalWrites|flatVMemInsts|scalarMemReads|vALUInsts|sALUInsts|totalCycles|tlbRequests)$/ {split($1,a,"."); key=a[2] "." a[4]; sum[key]+=$2} END {for (k in sum) print k, sum[k]}' m5out-hsa-remote-shader-resident-flag-forward-split-strict-shortspin/stats.txt
+```
+
+First relevant result:
+
+- The run completed via `m5_exit`:
+  `Exiting @ tick 24176962170 because m5_exit instruction encountered.`
+- The test printed:
+  `RESIDENT_FLAG_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- Split-line strict forward also observes the remote shader-store update.
+- The final result was:
+  `direction=forward layout=split-line sync=strict first=0x11112222 second=0x33334444 flag=1 spins=519 classification=1`.
+- The trace shows both writer and reader AQL completions:
+  - GPU0 writer completion at tick `24142169664`;
+  - GPU1 reader completion at tick `24142998168`.
+- The post-writer reader-completion stats block shows real reader memory
+  activity:
+  - `gpus1.flatVMemInsts 3`;
+  - `gpus1.tlbRequests 3`;
+  - `gpus1.numInstrExecuted 37`;
+  - `gpus1.completedWGs 1`;
+  - `gpus1.completedWfs 1`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the previous forward same-line pass was not solely a same-cache-line
+  artifact. With `value` and `flag` on separate cache lines, the resident
+  reader still observes the updated value after observing the flag.
+- Accepted: with strict synchronization and corrected volatile flag polling,
+  forward shader-store resident-reader behavior is updated for both same-line
+  and split-line layouts.
+- Not yet tested: reverse direction and weaker sync modes.
+
+Files changed:
+
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and stats for
+  `m5out-hsa-remote-shader-resident-flag-forward-split-strict-shortspin`.
+- No source changes or full simulation rerun were performed by Codex in this
+  step.
+
+Single next diagnostic step: run reverse split-line strict short-spin to check
+direction symmetry with the corrected polling semantics:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-shader-resident-flag-reverse-split-strict-shortspin -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp --debug-file=resident-flag.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag '--opts=--reverse --layout split-line --sync strict --spin-limit 1000000' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-07-01 resident-flag reverse split-line strict short-spin passes
+
+The user ran the reverse split-line strict control and asked Codex to inspect
+the trace.
+
+Commands run by Codex:
+
+```bash
+stat m5out-hsa-remote-shader-resident-flag-reverse-split-strict-shortspin/simout.txt m5out-hsa-remote-shader-resident-flag-reverse-split-strict-shortspin/simerr.txt m5out-hsa-remote-shader-resident-flag-reverse-split-strict-shortspin/resident-flag.trace m5out-hsa-remote-shader-resident-flag-reverse-split-strict-shortspin/stats.txt
+rg -n "RESIDENT_FLAG|resident_flag|first_read_done|reader_done|wait resident flag|completion|H2D_GPU1_INITIAL|doorbell route|SESDMA|Blit kernel|HSA AQL Kernel Complete|notify WgCompl|panic|fatal|assert|Exiting|simulate\\(\\) limit|user interrupt" m5out-hsa-remote-shader-resident-flag-reverse-split-strict-shortspin/simout.txt m5out-hsa-remote-shader-resident-flag-reverse-split-strict-shortspin/simerr.txt m5out-hsa-remote-shader-resident-flag-reverse-split-strict-shortspin/resident-flag.trace
+tail -120 m5out-hsa-remote-shader-resident-flag-reverse-split-strict-shortspin/simout.txt
+awk '/Begin Simulation Statistics/{blk++} /simTicks|finalTick|hostSeconds|simInsts|simOps/{print "block=" blk, NR ":" $0}' m5out-hsa-remote-shader-resident-flag-reverse-split-strict-shortspin/stats.txt
+awk 'NR>=72612 && NR<96294 && $1 ~ /^board\\.gpus[01]\\.CUs[0-9]+\\.(numInstrExecuted|completedWfs|completedWGs|globalReads|globalWrites|flatVMemInsts|scalarMemReads|vALUInsts|sALUInsts|totalCycles|tlbRequests)$/ {split($1,a,"."); key=a[2] "." a[4]; sum[key]+=$2} END {for (k in sum) print k, sum[k]}' m5out-hsa-remote-shader-resident-flag-reverse-split-strict-shortspin/stats.txt
+```
+
+First relevant result:
+
+- The run completed via `m5_exit`:
+  `Exiting @ tick 24200896212 because m5_exit instruction encountered.`
+- The test printed:
+  `RESIDENT_FLAG_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- Reverse split-line strict also observes the remote shader-store update.
+- The final result was:
+  `direction=reverse layout=split-line sync=strict first=0x11112222 second=0x33334444 flag=1 spins=514 classification=1`.
+- Reverse mode used GPU0 as reader and GPU1 as writer:
+  - `hsa_queue_create GPU0 reader`;
+  - `hsa_queue_create GPU1 writer`.
+- The trace shows both writer and reader AQL completions:
+  - GPU1 writer completion at tick `24166190619`;
+  - GPU0 reader completion at tick `24167015793`.
+- The post-writer reader-completion stats block shows real GPU0 reader memory
+  activity:
+  - `gpus0.flatVMemInsts 3`;
+  - `gpus0.tlbRequests 3`;
+  - `gpus0.numInstrExecuted 37`;
+  - `gpus0.completedWGs 1`;
+  - `gpus0.completedWfs 1`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: strict split-line behavior is direction-symmetric for this
+  resident-reader litmus.
+- Accepted: with corrected volatile flag polling, both forward and reverse
+  strict split-line tests observe updated values.
+- Not yet tested: weaker synchronization modes, especially whether removing
+  writer/reader fences changes visibility.
+
+Files changed:
+
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and stats for
+  `m5out-hsa-remote-shader-resident-flag-reverse-split-strict-shortspin`.
+- No source changes or full simulation rerun were performed by Codex in this
+  step.
+
+Single next diagnostic step: run a weaker sync control, starting with
+`--sync writer-fence-only`, to check whether the reader-side strict fence is
+required after observing the flag:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp --debug-file=resident-flag.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag '--opts=--layout split-line --sync writer-fence-only --spin-limit 1000000' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-07-01 resident-flag forward split-line writer-fence-only short-spin passes
+
+The user ran the weaker forward split-line control with writer-side ordering
+only and asked Codex to inspect the trace.
+
+Commands run by Codex:
+
+```bash
+stat m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin/simout.txt m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin/simerr.txt m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin/resident-flag.trace m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin/stats.txt
+rg -n "RESIDENT_FLAG|resident_flag|first_read_done|reader_done|wait resident flag|completion|H2D_GPU1_INITIAL|doorbell route|SESDMA|Blit kernel|HSA AQL Kernel Complete|notify WgCompl|panic|fatal|assert|Exiting|simulate\\(\\) limit|user interrupt" m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin/simout.txt m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin/simerr.txt m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin/resident-flag.trace
+tail -120 m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin/simout.txt
+tail -80 m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin/simerr.txt
+awk '/Begin Simulation Statistics/{blk++} /simTicks|finalTick|hostSeconds|simInsts|simOps/{print "block=" blk, NR ":" $0}' m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin/stats.txt
+awk 'BEGIN{start=0; prev=0} /Begin Simulation Statistics/{prev=start; start=NR} END{print "prev=" prev, "last=" start}' m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin/stats.txt
+awk 'NR>=72604 && NR<96324 && $1 ~ /^board\\.gpus[01]\\.CUs[0-9]+\\.(numInstrExecuted|completedWfs|completedWGs|globalReads|globalWrites|flatVMemInsts|scalarMemReads|vALUInsts|sALUInsts|totalCycles|tlbRequests)$/ {split($1,a,"."); key=a[2] "." a[4]; sum[key]+=$2} END {for (k in sum) print k, sum[k]}' m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin/stats.txt | sort
+```
+
+First relevant result:
+
+- The run completed via `m5_exit`:
+  `Exiting @ tick 24168435039 because m5_exit instruction encountered.`
+- The test printed:
+  `RESIDENT_FLAG_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- Forward split-line `writer-fence-only` also observes the remote shader-store
+  update.
+- The final result was:
+  `direction=forward layout=split-line sync=writer-fence-only first=0x11112222 second=0x33334444 flag=1 spins=524 classification=1`.
+- The trace shows both writer and reader AQL completions:
+  - GPU0 writer completion at tick `24133479363`;
+  - GPU1 reader completion at tick `24134504337`.
+- The post-writer reader-completion stats block shows real GPU1 reader memory
+  activity:
+  - `gpus1.flatVMemInsts 5`;
+  - `gpus1.tlbRequests 5`;
+  - `gpus1.numInstrExecuted 51`;
+  - `gpus1.completedWGs 1`;
+  - `gpus1.completedWfs 1`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the reader-side strict fence is not required for this litmus to
+  observe the updated value after it observes the flag.
+- Accepted: writer-side ordering plus volatile flag polling is sufficient in
+  this forward split-line run.
+- Not yet tested: whether removing the writer-side fence as well changes
+  visibility.
+
+Files changed:
+
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and stats for
+  `m5out-hsa-remote-shader-resident-flag-forward-split-writer-fence-only-shortspin`.
+- No source changes or full simulation rerun were performed by Codex in this
+  step.
+
+Single next diagnostic step: run the no-fence forward split-line short-spin
+control to check whether the writer-side fence is also unnecessary in this
+specific litmus:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp --debug-file=resident-flag.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag '--opts=--layout split-line --sync no-fence --spin-limit 1000000' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-07-01 resident-flag forward split-line no-fence short-spin passes
+
+The user ran the no-fence forward split-line control and asked Codex to inspect
+the trace.
+
+Commands run by Codex:
+
+```bash
+stat m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin/simout.txt m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin/simerr.txt m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin/resident-flag.trace m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin/stats.txt
+rg -n "RESIDENT_FLAG|resident_flag|first_read_done|reader_done|wait resident flag|completion|H2D_GPU1_INITIAL|doorbell route|SESDMA|Blit kernel|HSA AQL Kernel Complete|notify WgCompl|panic|fatal|assert|Exiting|simulate\\(\\) limit|user interrupt" m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin/simout.txt m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin/simerr.txt m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin/resident-flag.trace
+tail -120 m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin/simout.txt
+tail -80 m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin/simerr.txt
+awk '/Begin Simulation Statistics/{blk++} /simTicks|finalTick|hostSeconds|simInsts|simOps/{print "block=" blk, NR ":" $0}' m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin/stats.txt
+awk 'BEGIN{start=0; prev=0} /Begin Simulation Statistics/{prev=start; start=NR} END{print "prev=" prev, "last=" start}' m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin/stats.txt
+awk 'NR>=72623 && NR<96300 && $1 ~ /^board\\.gpus[01]\\.CUs[0-9]+\\.(numInstrExecuted|completedWfs|completedWGs|globalReads|globalWrites|flatVMemInsts|scalarMemReads|vALUInsts|sALUInsts|totalCycles|tlbRequests)$/ {split($1,a,"."); key=a[2] "." a[4]; sum[key]+=$2} END {for (k in sum) print k, sum[k]}' m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin/stats.txt | sort
+git diff --check
+```
+
+First relevant result:
+
+- The run completed via `m5_exit`:
+  `Exiting @ tick 24200045730 because m5_exit instruction encountered.`
+- The test printed:
+  `RESIDENT_FLAG_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- Forward split-line `no-fence` also observes the remote shader-store update.
+- The final result was:
+  `direction=forward layout=split-line sync=no-fence first=0x11112222 second=0x33334444 flag=1 spins=513 classification=1`.
+- The trace shows both writer and reader AQL completions:
+  - GPU0 writer completion at tick `24165199944`;
+  - GPU1 reader completion at tick `24166136007`.
+- The post-writer reader-completion stats block shows real GPU1 reader memory
+  activity:
+  - `gpus1.flatVMemInsts 5`;
+  - `gpus1.tlbRequests 5`;
+  - `gpus1.numInstrExecuted 43`;
+  - `gpus1.completedWGs 1`;
+  - `gpus1.completedWfs 1`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: neither the writer-side fence nor the reader-side strict fence is
+  required for this specific forward split-line resident-reader litmus to
+  observe the updated value after observing the flag.
+- Accepted: the flag-polling synchronization itself is enough to make this
+  test pass in the current model.
+- Not proven: full GPU-to-GPU cache coherence under arbitrary ordering,
+  multiple waves, multiple cache lines, or relaxed race patterns.
+
+Files changed:
+
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and stats for
+  `m5out-hsa-remote-shader-resident-flag-forward-split-no-fence-shortspin`.
+- `git diff --check` passed.
+- No source changes or full simulation rerun were performed by Codex in this
+  step.
+
+Single next diagnostic step: run the no-fence reverse split-line short-spin
+control to check direction symmetry under the weakest synchronization mode:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp --debug-file=resident-flag.trace configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag '--opts=--reverse --layout split-line --sync no-fence --spin-limit 1000000' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-07-01 resident-flag reverse split-line no-fence short-spin passes
+
+The user ran the no-fence reverse split-line control and asked Codex to inspect
+the trace.
+
+Commands run by Codex:
+
+```bash
+stat m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin/simout.txt m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin/simerr.txt m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin/resident-flag.trace m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin/stats.txt
+rg -n "RESIDENT_FLAG|resident_flag|first_read_done|reader_done|wait resident flag|completion|H2D_GPU1_INITIAL|doorbell route|SESDMA|Blit kernel|HSA AQL Kernel Complete|notify WgCompl|panic|fatal|assert|Exiting|simulate\\(\\) limit|user interrupt" m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin/simout.txt m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin/simerr.txt m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin/resident-flag.trace
+tail -120 m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin/simout.txt
+tail -80 m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin/simerr.txt
+awk '/Begin Simulation Statistics/{blk++} /simTicks|finalTick|hostSeconds|simInsts|simOps/{print "block=" blk, NR ":" $0}' m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin/stats.txt
+awk 'BEGIN{start=0; prev=0} /Begin Simulation Statistics/{prev=start; start=NR} END{print "prev=" prev, "last=" start}' m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin/stats.txt
+awk 'NR>=72599 && NR<96300 && $1 ~ /^board\\.gpus[01]\\.CUs[0-9]+\\.(numInstrExecuted|completedWfs|completedWGs|globalReads|globalWrites|flatVMemInsts|scalarMemReads|vALUInsts|sALUInsts|totalCycles|tlbRequests)$/ {split($1,a,"."); key=a[2] "." a[4]; sum[key]+=$2} END {for (k in sum) print k, sum[k]}' m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin/stats.txt | sort
+git diff --check
+```
+
+First relevant result:
+
+- The run completed via `m5_exit`:
+  `Exiting @ tick 24174494640 because m5_exit instruction encountered.`
+- The test printed:
+  `RESIDENT_FLAG_PASSED_UPDATED`.
+
+Facts confirmed:
+
+- Reverse split-line `no-fence` also observes the remote shader-store update.
+- The final result was:
+  `direction=reverse layout=split-line sync=no-fence first=0x11112222 second=0x33334444 flag=1 spins=513 classification=1`.
+- Reverse mode used GPU0 as reader and GPU1 as writer:
+  - `hsa_queue_create GPU0 reader`;
+  - `hsa_queue_create GPU1 writer`.
+- The trace shows both writer and reader AQL completions:
+  - GPU1 writer completion at tick `24139597239`;
+  - GPU0 reader completion at tick `24140548287`.
+- The post-writer reader-completion stats block shows real GPU0 reader memory
+  activity:
+  - `gpus0.flatVMemInsts 5`;
+  - `gpus0.tlbRequests 5`;
+  - `gpus0.numInstrExecuted 51`;
+  - `gpus0.completedWGs 1`;
+  - `gpus0.completedWfs 1`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: no-fence split-line behavior is direction-symmetric for this
+  resident-reader litmus.
+- Accepted: the corrected flag-polling synchronization is sufficient for both
+  forward and reverse split-line no-fence runs to observe updated values in
+  the current model.
+- Not proven: full GPU-to-GPU cache coherence under arbitrary ordering,
+  multiple waves, multiple cache lines, or relaxed race patterns.
+
+Files changed:
+
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and stats for
+  `m5out-hsa-remote-shader-resident-flag-reverse-split-no-fence-shortspin`.
+- `git diff --check` passed.
+- No source changes or full simulation rerun were performed by Codex in this
+  step.
+
+Single next diagnostic step: summarize the resident-flag functional evidence
+and decide whether to add one more functional litmus with multiple value
+locations or move back to HIP/ROCm API compatibility work.
+
+## 2026-07-01 resident-flag coherence smoke phase summary
+
+The user decided to treat the current resident-flag coherence smoke results as
+the established functional baseline and return to HIP/ROCm API compatibility
+work.
+
+Commands run by Codex:
+
+```bash
+git status --short
+sed -n '1,1120p' docs/debug/se-multigpu-status.md | tail -320
+```
+
+First relevant result:
+
+- The completed resident-reader smoke set consistently printed
+  `RESIDENT_FLAG_PASSED_UPDATED` and exited through `m5_exit`.
+
+Facts confirmed:
+
+- The standalone resident-reader test is:
+  `tests/test-progs/gpu/xgmi-peer-vram/hsa_remote_shader_resident_flag`.
+- The test uses one long-lived reader dispatch and one writer dispatch:
+  - reader first reads `value`;
+  - reader spins on `flag`;
+  - writer stores the updated `value`;
+  - writer stores `flag = 1`;
+  - reader rereads `value` after observing the flag.
+- Only the flag-polling load is volatile. The first and second `value` reads
+  are ordinary shader loads.
+- The following functional cases passed:
+  - forward same-line strict;
+  - forward split-line strict;
+  - reverse split-line strict;
+  - forward split-line writer-fence-only;
+  - forward split-line no-fence;
+  - reverse split-line no-fence.
+- In each inspected case, trace and stats confirmed real reader GPU memory
+  activity and kernel completion, not only host-side result observation.
+- The strongest currently supported claim is functional visibility for these
+  resident-reader smoke cases. This is a baseline for future work, not proof of
+  arbitrary multi-GPU coherence under all races, all cache states, all wave
+  interactions, or all application patterns.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the earlier resident-reader hang was caused by non-volatile flag
+  polling being optimized into ineffective polling behavior.
+- Accepted: after narrowing volatile behavior to the flag load, current
+  resident-reader functional smoke tests observe updated values in both
+  directions.
+- Accepted: for the tested split-line resident-reader litmus, strict fences
+  are not required for the test to pass in the current model.
+- Rejected: this smoke set alone is enough to declare full multi-GPU cache
+  coherence complete.
+
+Files changed:
+
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Documentation-only phase summary. No source changes, build, or full
+  simulation was run by Codex in this step.
+
+Single next diagnostic step: return to HIP/ROCm API compatibility work using
+the resident-flag smoke as the current coherence functional baseline. The next
+API target should start from the existing HIP smoke status, then isolate one
+API at a time, prioritizing `hipMalloc`, `hipMemset`, `hipMemcpy`,
+`hipLaunchKernel`, and `hipFree`, with SDMA-enabled HSA paths kept available
+as known-good lower-level transfer primitives.
+
+## 2026-07-01 HIP/ROCm API compatibility spec and plan
+
+The user accepted the strategy to return to HIP/ROCm API compatibility work
+and asked for a spec/plan.
+
+Commands run by Codex:
+
+```bash
+rg -n "HIP|ROCm|hip_api|hip-api|hipMemset|hipMemcpy|hipMalloc|hipLaunchKernel|hipFree|SDMA|resident-flag" /home/zhangds/.codex/memories/MEMORY.md
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/writing-plans/SKILL.md
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/brainstorming/SKILL.md
+git status --short
+sed -n '1,220p' docs/debug/se-multigpu-status.md
+rg --files tests/test-progs/gpu/hip-api-smoke tests/pyunit/stdlib configs/example/gem5_library src | rg "hip-api-smoke|se_hip|hip|kfd|gpu_render|sdma|hsa|x86-vega-xgmi|test_se_viper"
+rg -n "hipMalloc|hipMemset|hipMemcpy|hipLaunchKernel|hipFree|API_STAGE|se_hip|HSA_ENABLE_SDMA|SESDMA|m5_exit|stage" tests/test-progs/gpu/hip-api-smoke tests/pyunit/stdlib/test_se_viper_multigpu.py configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py src/dev src/gpu-compute src/sim | head -260
+sed -n '1,320p' tests/test-progs/gpu/hip-api-smoke/hip_api_smoke.hip
+sed -n '1,220p' tests/test-progs/gpu/hip-api-smoke/hip_memset_preload_smoke.hip
+sed -n '1,460p' tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_compat.cpp
+sed -n '1,180p' tests/test-progs/gpu/hip-api-smoke/Makefile
+sed -n '1,140p' tests/test-progs/gpu/hip-api-smoke/se_hip_compat/Makefile
+git diff --check
+rg -n "TBD|TODO|fill in|placeholder|later" docs/superpowers/specs/2026-07-01-hip-rocm-api-compat-design.md docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md || true
+```
+
+First relevant result:
+
+- Existing HIP smoke support already includes a cumulative
+  `hip_api_smoke`, a `hip_memset_preload_smoke`, and
+  `se_hip_compat/libse_hip_compat.so` with `hipMemset` interposition.
+
+Facts confirmed:
+
+- The resident-flag smoke is now the coherence functional baseline for this
+  phase.
+- The HIP/ROCm API plan should isolate APIs instead of relying only on the
+  cumulative `hip_api_smoke`.
+- The current compatibility direction is:
+  - native `hipMalloc`;
+  - existing preload `hipMemset`;
+  - new preload `hipMemcpy` using HSA async copy;
+  - native `hipLaunchKernel` with direct CPU validation;
+  - native `hipFree` diagnostic before deciding whether any interposition is
+    acceptable.
+- The plan preserves the rule that Codex does not start full gem5 simulations
+  unless delegated by the user.
+
+Hypotheses accepted or rejected:
+
+- Accepted: API compatibility should proceed one API at a time with explicit
+  pass markers and dedicated m5out directories.
+- Accepted: HSA SDMA/async-copy and resident-flag smokes are known-good
+  lower-level references for API work.
+- Rejected: declaring full ROCm runtime support from the current smoke tests.
+
+Files changed:
+
+- `docs/superpowers/specs/2026-07-01-hip-rocm-api-compat-design.md`
+- `docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- `git diff --check` passed.
+- Placeholder scan found only the plan self-review line describing the
+  placeholder scan; no unresolved spec/plan placeholders were found.
+- No source changes, build, or full simulation was run by Codex in this step.
+
+Single next diagnostic step: if the spec/plan is accepted, start Task 1 from
+`docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md`: add the native
+`hipMalloc` standalone smoke and structural pyunit, then ask the user to run
+the user-owned `m5out-hip-api-malloc-native` simulation.
+
+## 2026-07-01 Add ROCm source analysis to HIP API plan
+
+The user accepted adding ROCm source analysis as a root-cause step whenever an
+API blocks or enters an unexpected native ROCm path.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/writing-plans/SKILL.md
+git status --short
+rg -n "ROCm|root cause|卡|hipMalloc|hipMemset|hipMemcpy|hipLaunchKernel|hipFree|Task" docs/superpowers/specs/2026-07-01-hip-rocm-api-compat-design.md docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md docs/debug/se-multigpu-status.md | head -220
+git diff --check
+rg -n "TBD|TODO|fill in|placeholder|<source-file>|<start>|<end>|<m5out-dir>|<exact|<first|<one|<api|<chain|<backend|<trace|<inspection" docs/superpowers/specs/2026-07-01-hip-rocm-api-compat-design.md docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md || true
+```
+
+First relevant result:
+
+- The existing plan had isolated API smoke tests but did not yet require a
+  ROCm source-level root-cause pass before adding new preload or gem5
+  workarounds.
+
+Facts confirmed:
+
+- The spec now includes a ROCm source-analysis policy for blocked native API
+  paths.
+- The implementation plan now includes Task 8:
+  `ROCm source root-cause analysis for blocked APIs`.
+- Task 8 requires identifying the public HIP entry point, internal ROCm
+  function chain, selected backend, blocking wait object, gem5 trace
+  correlation, and intended fix layer.
+- The plan explicitly says not to fetch ROCm source without user approval.
+- The plan's source-analysis task uses shell variables and concrete examples
+  instead of unresolved angle-bracket placeholders.
+
+Hypotheses accepted or rejected:
+
+- Accepted: source analysis should be a required diagnostic gate after a
+  blocked native API run.
+- Accepted: the fix may still be in gem5, `SESDMAEngine`, HSA queue/signal
+  handling, VMA/mtype logic, test structure, or `se_hip_compat`; ROCm source is
+  mainly the reference for selecting the correct fix layer.
+- Rejected: adding preload shims blindly before understanding the native ROCm
+  branch.
+
+Files changed:
+
+- `docs/superpowers/specs/2026-07-01-hip-rocm-api-compat-design.md`
+- `docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Documentation update only. No source code, build, download, or simulation was
+  run in this step.
+- `git diff --check` passed.
+- Placeholder scan found only the plan self-review line named
+  `Placeholder scan`; no unresolved angle-bracket placeholders remain in the
+  spec/plan.
+
+Single next diagnostic step: after plan approval, start with Task 1
+(`hipMalloc` standalone smoke). If any API run blocks or fails, run Task 8
+before implementing a workaround.
+
+## 2026-07-01 Allow automatic ROCm source download to .deps
+
+The user approved automatically downloading ROCm source into `.deps` for the
+source-analysis step.
+
+Commands run by Codex:
+
+```bash
+rg -n "Do not fetch|without user approval|source tree|/tmp/rocm|ROCm source|\\.deps" docs/superpowers/specs/2026-07-01-hip-rocm-api-compat-design.md docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md docs/debug/se-multigpu-status.md | head -120
+sed -n '30,42p' docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md
+sed -n '50,78p' docs/superpowers/specs/2026-07-01-hip-rocm-api-compat-design.md
+sed -n '920,1048p' docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md
+```
+
+First relevant result:
+
+- The previous plan required user approval before fetching ROCm source and
+  used `/tmp` paths as the preferred source location.
+
+Facts confirmed:
+
+- The spec now records that ROCm source may be automatically downloaded when
+  needed.
+- The plan now uses `.deps/rocm-src-4.0.1` as the preferred source location.
+- Task 8 now includes clone commands for:
+  - `ROCm/HIP`;
+  - `ROCm/ROCclr`;
+  - `RadeonOpenCompute/ROCR-Runtime`.
+- The plan also includes `git ls-remote` fallback commands if a repository
+  does not have an exact `rocm-4.0.1` branch.
+
+Hypotheses accepted or rejected:
+
+- Accepted: `.deps` is the correct place for downloaded ROCm source in this
+  workspace.
+- Rejected: ROCm source download requires another approval after this user
+  confirmation, as long as the download remains scoped to this plan.
+
+Files changed:
+
+- `docs/superpowers/specs/2026-07-01-hip-rocm-api-compat-design.md`
+- `docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Documentation update only. No source download, build, or simulation was run
+  in this step.
+
+Single next diagnostic step: run Task 1 when implementation starts. If a later
+API blocks and ROCm source is missing, download the source under
+`.deps/rocm-src-4.0.1` before source-level root-cause analysis.
+
+## 2026-07-01 HIP API malloc standalone smoke implementation
+
+The user confirmed the HIP/ROCm API compatibility plan and asked Codex to
+execute it. Codex started with Task 1: native `hipMalloc` standalone smoke.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,260p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/executing-plans/SKILL.md
+sed -n '1,260p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/test-driven-development/SKILL.md
+sed -n '580,720p' tests/pyunit/stdlib/test_se_viper_multigpu.py
+sed -n '1,120p' tests/test-progs/gpu/hip-api-smoke/Makefile
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_malloc_smoke_contract
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_malloc_smoke_contract
+make -C tests/test-progs/gpu/hip-api-smoke hip_malloc_smoke ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc
+strings tests/test-progs/gpu/hip-api-smoke/hip_malloc_smoke | rg "HIP_API_MALLOC_PASSED"
+git diff --check
+```
+
+First relevant result:
+
+- RED failed as expected with:
+  `FileNotFoundError: ... hip_malloc_smoke.hip`.
+- GREEN passed:
+  `test_hip_malloc_smoke_contract ... OK`.
+- The new binary was built and contains:
+  `HIP_API_MALLOC_PASSED ptr=%p bytes=%zu`.
+
+Facts confirmed:
+
+- `tests/test-progs/gpu/hip-api-smoke/hip_malloc_smoke.hip` now exists.
+- The smoke calls `hipSetDevice(0)` and native `hipMalloc`.
+- It prints `HIP_API_MALLOC_PASSED` after observing a non-null pointer.
+- It uses `m5_exit(0)` after the result is known.
+- It intentionally does not call `hipFree`, so native free/teardown behavior is
+  not part of this smoke.
+- `tests/test-progs/gpu/hip-api-smoke/Makefile` now builds
+  `hip_malloc_smoke`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the native `hipMalloc` API can be isolated without exercising
+  `hipMemset`, `hipMemcpy`, `hipLaunchKernel`, or `hipFree`.
+- Rejected: this smoke can validate ROCm teardown or allocation freeing.
+
+Files changed:
+
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- `tests/test-progs/gpu/hip-api-smoke/Makefile`
+- `tests/test-progs/gpu/hip-api-smoke/hip_malloc_smoke.hip`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- TDD RED focused pyunit failed for the missing smoke source.
+- TDD GREEN focused pyunit passed after adding the smoke and Makefile target.
+- `make -C tests/test-progs/gpu/hip-api-smoke hip_malloc_smoke ...` passed.
+- `strings ... | rg "HIP_API_MALLOC_PASSED"` passed.
+- `git diff --check` passed.
+- No full gem5 simulation was run by Codex in this step.
+
+Single next diagnostic step: the user should run the native malloc smoke:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hip-api-malloc-native -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/hip-api-smoke/hip_malloc_smoke --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-07-01 HIP API malloc native smoke passes
+
+The user ran the native `hipMalloc` standalone smoke and asked Codex to inspect
+the output.
+
+Commands run by Codex:
+
+```bash
+git status --short
+stat m5out-hip-api-malloc-native/simout.txt m5out-hip-api-malloc-native/simerr.txt m5out-hip-api-malloc-native/stats.txt 2>/dev/null || true
+find m5out-hip-api-malloc-native -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+rg -n "HIP_API_MALLOC_PASSED|HIP malloc smoke failed|hipMalloc|hipSetDevice|panic|fatal|assert|Exiting|simulate\\(\\) limit|user interrupt|KVM|Page fault|hsaKmt|SESDMA|doorbell route|HSA AQL Kernel Complete" m5out-hip-api-malloc-native || true
+tail -160 m5out-hip-api-malloc-native/simout.txt
+tail -160 m5out-hip-api-malloc-native/simerr.txt
+```
+
+First relevant result:
+
+- The smoke printed:
+  `HIP_API_MALLOC_PASSED ptr=0x7ffdee800000 bytes=1024`.
+- The run exited via:
+  `Exiting @ tick 43790249250 because m5_exit instruction encountered.`
+
+Facts confirmed:
+
+- Native `hipSetDevice(0)` and `hipMalloc` completed for this standalone smoke.
+- The returned device pointer was non-null:
+  `0x7ffdee800000`.
+- The allocation path reached KFD memory allocation and mapping:
+  - `[hsaKmtAllocMemory] node 1`;
+  - `GPURenderDriver::mmap returning start address 0x7ffdee800000`;
+  - `[hsaKmtMapMemoryToGPUNodes] address 0x7ffdee800000 number of nodes 1`.
+- No panic, fatal, assertion, page fault, max-tick exit, or user interrupt was
+  observed.
+- This run did not enable gem5 debug flags, so no separate debug trace file was
+  produced; stdout, stderr, config, and stats are the evidence for this step.
+
+Hypotheses accepted or rejected:
+
+- Accepted: native `hipMalloc` is sufficient for the isolated malloc smoke in
+  the current SE multi-GPU setup.
+- Rejected: this run validates `hipFree`, teardown, `hipMemset`, `hipMemcpy`,
+  or kernel launch behavior.
+
+Files changed:
+
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- Read-only inspection of `m5out-hip-api-malloc-native/simout.txt`,
+  `simerr.txt`, file listing, and stats file presence.
+- No source changes, build, or full simulation was run by Codex in this step.
+
+Single next diagnostic step: proceed to Task 2 from
+`docs/superpowers/plans/2026-07-01-hip-rocm-api-compat.md`: stabilize and
+rerun the existing preload `hipMemset` baseline with
+`LD_PRELOAD=libse_hip_compat.so`.
+
+## 2026-07-01 HIP API malloc smoke adds device parameter
+
+The user asked whether `hipSetDevice(1) + native hipMalloc` should also be
+tested. Codex agreed that it is a useful symmetry check before leaving the
+`hipMalloc` stage and updated the standalone smoke to support a device
+argument.
+
+Commands run by Codex:
+
+```bash
+sed -n '660,700p' tests/pyunit/stdlib/test_se_viper_multigpu.py
+sed -n '1,120p' tests/test-progs/gpu/hip-api-smoke/hip_malloc_smoke.hip
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_malloc_smoke_contract
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_malloc_smoke_contract
+make -C tests/test-progs/gpu/hip-api-smoke hip_malloc_smoke ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc
+strings tests/test-progs/gpu/hip-api-smoke/hip_malloc_smoke | rg "HIP_API_MALLOC_PASSED device=%d|--device|usage:"
+git diff --check
+```
+
+First relevant result:
+
+- RED failed as expected because `parse_device` was not yet present.
+- GREEN passed after adding `--device` support.
+- The rebuilt binary contains:
+  `HIP_API_MALLOC_PASSED device=%d ptr=%p bytes=%zu`.
+
+Facts confirmed:
+
+- `hip_malloc_smoke` now accepts `--device N`.
+- If no argument is provided, it defaults to device 0, preserving the previous
+  run command.
+- The smoke now calls `hipSetDevice(device)`.
+- The pass marker now includes the selected device id.
+- The smoke still intentionally avoids `hipFree`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: GPU1 native allocation should be checked as part of the malloc
+  API baseline before moving to `hipMemset`.
+- Rejected: adding a device parameter changes the scope to `hipFree` or
+  teardown testing.
+
+Files changed:
+
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- `tests/test-progs/gpu/hip-api-smoke/hip_malloc_smoke.hip`
+- `docs/debug/se-multigpu-status.md`
+
+Verification completed:
+
+- TDD RED focused pyunit failed for the missing device parsing.
+- TDD GREEN focused pyunit passed after the change.
+- `make -C tests/test-progs/gpu/hip-api-smoke hip_malloc_smoke ...` passed.
+- `strings ... | rg "HIP_API_MALLOC_PASSED device=%d|--device|usage:"`
+  passed.
+- `git diff --check` passed.
+- No full gem5 simulation was run by Codex in this step.
+
+Single next diagnostic step: the user should run the GPU1 native malloc smoke:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hip-api-malloc-native-device1 -r -e --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing --app tests/test-progs/gpu/hip-api-smoke/hip_malloc_smoke '--opts=--device 1' --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu --env HSA_ENABLE_SDMA=1
+```
+
 ## Goal
 
 Build a gem5 SE-mode multi-GPU platform for validating cache-coherence
@@ -13913,3 +16325,354 @@ Verification completed:
 Single next diagnostic step: decide whether to commit the current functional
 diagnostic state, or add one more same-dispatch/resident-reader litmus if the
 goal is to remove kernel-boundary effects even further.
+
+## 2026-07-01 SE SDMA atomic completeness review
+
+The user asked to review the large current change by logical flow and determine
+whether it is complete.  Codex performed static inspection and lightweight
+pyunit checks only; no gem5 build or long simulation was started.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' AGENTS.md
+sed -n '1,260p' docs/debug/se-multigpu-status.md
+git status --short
+git diff -- src/dev/dma_device.cc src/dev/dma_device.hh src/dev/hsa/se_sdma_engine.cc src/dev/hsa/se_sdma_engine.hh src/mem/ruby/protocol/MOESI_AMD_Base-msg.sm src/mem/ruby/protocol/MOESI_AMD_Base-dma.sm src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm tests/pyunit/stdlib/test_se_viper_multigpu.py
+rg -n "access_backing_store|accessBackingStore|access_backing" src configs tests -S
+nl -ba src/mem/ruby/system/RubyPort.cc | sed -n '617,690p'
+nl -ba src/mem/abstract_mem.cc | sed -n '379,520p'
+rg -n "BDW_Pm|BDW_PM|BDW_M|ProbeAcksComplete|da_sendResponseDmaAck|wd_writeBackData" src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_se_sdma_atomic_uses_single_ruby_atomic_request test_se_viper_multigpu.SEViperMultiGPUTest.test_se_sdma_engine_has_phase1_packet_handlers test_se_viper_multigpu.SEViperMultiGPUTest.test_directory_b_state_debug_instrumentation_contract
+git diff --check
+git status --short
+git diff --stat
+```
+
+First relevant observable result:
+
+```text
+Ran 3 tests in 0.001s
+
+OK
+```
+
+Facts confirmed:
+
+- The intended SE SDMA atomic path is now single-request:
+  `SESDMAEngine::executeAtomic()` -> `dmaAtomicAddr()` -> `DmaDevice::dmaAtomic()`
+  -> `DmaPort` `SwapReq` with `AtomicOpAdd<uint64_t>` -> `DMASequencer`
+  `SequencerRequestType:ATOMIC` -> DMA controller `BUSY_ATOMIC` -> directory
+  `DMARequestType:ATOMIC` -> directory atomic writeback -> DMA data response ->
+  `DMASequencer::atomicCallback()` -> SDMA packet completion.
+- Directory DMA atomic response ordering is closed for both relevant orders:
+  if probes complete before memory data, `BDW_M + MemData` writes data and
+  responds; if memory data arrives first, `BDW_Pm + ProbeAcksComplete` writes
+  data and responds.
+- A completeness gap was found during review: with
+  `access_backing_store=True`, `RubyPort::hitCallback()` would otherwise apply
+  the same `SwapReq` atomic again to the backing store after the Ruby protocol
+  already applied it.  This is non-idempotent for signal `ADD64`.
+- The gap was fixed by marking DMA atomic requests with `Request::NO_ACCESS`
+  and making `RubyPort::hitCallback()` skip backing-store access for
+  `NO_ACCESS` requests.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the earlier read+write SDMA atomic implementation was incomplete
+  because Ruby could observe the signal line in a transient busy state.
+- Accepted: a single Ruby atomic request is the correct functional shape for
+  SDMA signal increments.
+- Accepted: ordinary DMA writes can tolerate backing-store callback writes
+  because they are idempotent for the same value, but atomic ADD64 cannot.
+
+Files changed:
+
+- `src/dev/dma_device.hh`
+- `src/mem/ruby/system/RubyPort.cc`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document
+
+Verification completed:
+
+- Structural pyunit checks for the SE SDMA atomic path, phase-1 SDMA handlers,
+  and directory B-state debug contract passed.
+- `git diff --check` completed without whitespace errors.
+
+Single next diagnostic step: rebuild gem5 on the user's side and rerun the
+previous `hipMemcpy` preload B-debug case.  Expected evidence is that SDMA
+signal completion uses a single Ruby atomic request, no `B + MemData` panic is
+seen on the signal line, and the signal value is not double-incremented by
+backing-store callback access.
+
+## 2026-07-01 SE SDMA atomic signal visibility follow-up
+
+The user reran the `hipMemcpy` preload B-debug case and reported that the trace
+stopped growing.  Codex inspected the existing output directory only:
+
+`m5out-hip-api-memcpy-preload-bdebug`
+
+Commands run by Codex:
+
+```bash
+ps -C gem5.opt -o pid,etime,time,pcpu,stat,args
+find m5out-hip-api-memcpy-preload-bdebug -maxdepth 1 -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n' | sort
+tail -120 m5out-hip-api-memcpy-preload-bdebug/simout.txt
+tail -180 m5out-hip-api-memcpy-preload-bdebug/simerr.txt
+rg -n "HIP_MEMCPY_PRELOAD|begin hipMemcpy|end hipMemcpy|PASSED|FAILED|Exiting @|simulate\\(\\) limit|panic|fatal|assert|Invalid transition|B-debug|MemData-debug|SDMA atomic|via Ruby atomic|atomicCallback|DMARequestType|BUSY_ATOMIC|doorbell route|queue 2 drained|queue 1 drained|signal|hsa_signal|Poll|poll" m5out-hip-api-memcpy-preload-bdebug/simout.txt m5out-hip-api-memcpy-preload-bdebug/simerr.txt m5out-hip-api-memcpy-preload-bdebug/hip-api-memcpy-preload.trace
+tail -120 m5out-hip-api-memcpy-preload-bdebug/hip-api-memcpy-preload.trace
+rg -n "^simTicks|^finalTick|^hostSeconds|^hostTickRate|^simSeconds|^simInsts|^simOps|board.processor.cores0.core.thread_0.numInsts|board.processor.cores0.core.thread_0.numOps|board.processor.cores0.core.executeStats0.numInsts|board.processor.cores0.core.executeStats0.numLoadInsts|board.processor.cores0.core.executeStats0.numStoreInsts|board.processor.cores0.core.exec_context.thread_0.numIdleCycles|board.processor.cores0.core.exec_context.thread_0.numBusyCycles" m5out-hip-api-memcpy-preload-bdebug/stats.txt
+sed -n '1,240p' tests/test-progs/gpu/hip-api-smoke/hip_memcpy_preload_smoke.hip
+sed -n '260,520p' tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_compat.cpp
+nl -ba src/mem/ruby/common/DataBlock.cc | sed -n '141,151p'
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_se_sdma_atomic_uses_single_ruby_atomic_request test_se_viper_multigpu.SEViperMultiGPUTest.test_se_sdma_engine_has_phase1_packet_handlers test_se_viper_multigpu.SEViperMultiGPUTest.test_directory_b_state_debug_instrumentation_contract
+git diff --check
+```
+
+First relevant observable result:
+
+```text
+47149459345: board.gpus0.se_sdma_engine: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ae88 src 0xffffffffffffffff via Ruby atomic
+47149600537: board.gpus0.se_sdma_engine: SDMA queue 2 drained at rptr 84
+47153557242: board.cache_hierarchy.ruby_system.directory_controllers0: MOESI_AMD_Base-dir.sm:395: dir MemData-debug before trigger addr 0x1346e80 state B_M
+47153561904: board.cache_hierarchy.ruby_system.directory_controllers0: MOESI_AMD_Base-dir.sm:1379: dir B-debug exit CoreUnblock addr 0x1346e80
+```
+
+Facts confirmed:
+
+- No running `gem5.opt` process was visible during inspection.
+- `simout.txt` contains no normal `Exiting @` line and no
+  `HIP_MEMCPY_PRELOAD_PASSED`.
+- No panic/fatal/assert/invalid-transition was found in stdout, stderr, or the
+  trace.
+- The previous `B + MemData` panic did not recur in the inspected log.
+- The SDMA packet now uses the intended single Ruby atomic path and queue 2
+  drains.
+- The original `NO_ACCESS` backing-store fix was incomplete: it avoided
+  double-applying `SwapReq`, but could leave `access_backing_store=True`
+  physical memory stale, so CPU/runtime signal waits could continue seeing the
+  old signal value.
+- `DataBlock::atomicPartial()` copies the original block and then performs the
+  atomic, so the DataBlock returned to `DMASequencer::atomicCallback()` carries
+  the post-atomic value.
+
+Hypotheses accepted or rejected:
+
+- Rejected: this rerun is still failing because of the old `B + MemData` panic.
+- Accepted: the likely new issue is signal visibility through the Ruby backing
+  store after the earlier `NO_ACCESS` change.
+- Accepted: the correct fix is to let Ruby perform the atomic once, then convert
+  the DMA packet to a normal `WriteReq` containing the post-atomic value before
+  `RubyPort::hitCallback()`, so backing store is updated exactly once without
+  re-executing the atomic operation.
+
+Files changed:
+
+- `src/dev/dma_device.hh`
+- `src/mem/ruby/system/DMASequencer.cc`
+- `src/mem/ruby/system/RubyPort.cc`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document
+
+Verification completed:
+
+- Structural pyunit checks for the SE SDMA atomic path, phase-1 SDMA handlers,
+  and directory B-state debug contract passed.
+- `git diff --check` completed without whitespace errors.
+
+Single next diagnostic step: rebuild gem5 and rerun the same
+`hipMemcpy` preload B-debug case.  Expected evidence is:
+
+- `SDMA atomic ADD64 ... via Ruby atomic`;
+- `SDMA queue 2 drained`;
+- no `B + MemData` panic;
+- `HIP_MEMCPY_PRELOAD_PASSED` followed by normal `m5_exit`.
+
+Follow-up verification result:
+
+The user rebuilt gem5 and reran into the same directory:
+
+`m5out-hip-api-memcpy-preload-bdebug`
+
+Commands run by Codex:
+
+```bash
+ps -C gem5.opt -o pid,etime,time,pcpu,stat,args
+find m5out-hip-api-memcpy-preload-bdebug -maxdepth 1 -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n' | sort
+tail -160 m5out-hip-api-memcpy-preload-bdebug/simout.txt
+tail -220 m5out-hip-api-memcpy-preload-bdebug/simerr.txt
+rg -n "HIP_MEMCPY_PRELOAD_PASSED|Exiting @|SDMA atomic ADD64|via Ruby atomic|SDMA queue 2 drained|dir MemData-debug|dir B-debug|Invalid transition|panic|fatal|assert|B \\+ MemData" m5out-hip-api-memcpy-preload-bdebug/simout.txt m5out-hip-api-memcpy-preload-bdebug/simerr.txt m5out-hip-api-memcpy-preload-bdebug/hip-api-memcpy-preload.trace
+rg -n "^simTicks|^finalTick|^hostSeconds|^hostTickRate|^simSeconds|^simInsts|^simOps" m5out-hip-api-memcpy-preload-bdebug/stats.txt
+```
+
+First relevant observable result:
+
+```text
+HIP_MEMCPY_PRELOAD_PASSED
+Exiting @ tick 47173424022 because m5_exit instruction encountered.
+```
+
+Key trace evidence:
+
+```text
+47149459345: board.gpus0.se_sdma_engine: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ae88 src 0xffffffffffffffff via Ruby atomic
+47149600537: board.gpus0.se_sdma_engine: SDMA queue 2 drained at rptr 84
+47159994133: board.gpus0.se_sdma_engine: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ae88 src 0xffffffffffffffff via Ruby atomic
+47160113014: board.gpus0.se_sdma_engine: SDMA queue 2 drained at rptr 168
+```
+
+Facts confirmed:
+
+- The `hipMemcpy` preload smoke completed and printed
+  `HIP_MEMCPY_PRELOAD_PASSED`.
+- The simulation exited normally via `m5_exit` at tick `47173424022`.
+- The final stats dump contains `finalTick 47173424022`, matching stdout.
+- Both SDMA signal completions used the single Ruby atomic path.
+- Both queue-2 SDMA packets drained.
+- No `panic`, `fatal`, `assert`, or invalid transition appeared in the
+  inspected stdout/stderr/trace output.
+- The previous signal-line `B + MemData` failure did not recur.
+
+Hypotheses accepted or rejected:
+
+- Accepted: converting the DMA atomic callback packet to a `WriteReq` carrying
+  the post-atomic value fixes the backing-store visibility problem without
+  re-executing the atomic operation.
+- Accepted: the minimal SE SDMA atomic path is now sufficient for this
+  `hipMemcpy` preload H2D+D2H smoke.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, and stats for the successful
+  rerun.
+
+Single next diagnostic step: remove or narrow the temporary
+`RubyDirSDMADebug` signal-line instrumentation before committing, or run the
+same preload smoke without `RubyDirSDMADebug` to confirm the quiet functional
+path.
+
+Follow-up instrumentation cleanup:
+
+The user accepted the recommendation to clean up temporary signal-line
+instrumentation.  Codex removed the narrow `RubyDirSDMADebug` debug flag and
+the `dir MemData-debug` / `dir B-debug` markers from the Directory protocol.
+No SDMA functional path was changed in this cleanup step.
+
+Commands run by Codex:
+
+```bash
+rg -n "RubyDirSDMADebug|dir MemData-debug|dir B-debug|intToAddress\\(20213376\\)|20213376|0x1346e80" src/mem/ruby/SConscript src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm tests/pyunit/stdlib/test_se_viper_multigpu.py
+rg -n "RubyDirSDMADebug|dir MemData-debug|dir B-debug|intToAddress\\(20213376\\)|dbg_b_" src/mem/ruby/SConscript src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm tests/pyunit/stdlib/test_se_viper_multigpu.py || true
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_se_sdma_atomic_uses_single_ruby_atomic_request test_se_viper_multigpu.SEViperMultiGPUTest.test_se_sdma_engine_has_phase1_packet_handlers test_se_viper_multigpu.SEViperMultiGPUTest.test_directory_b_state_debug_instrumentation_removed_after_sdma_fix
+git diff --check
+```
+
+First relevant observable result:
+
+```text
+Ran 3 tests in 0.001s
+
+OK
+```
+
+Facts confirmed:
+
+- `src/mem/ruby/SConscript` no longer registers `RubyDirSDMADebug`.
+- `MOESI_AMD_Base-dir.sm` no longer contains the temporary signal-line address
+  filter `intToAddress(20213376)`.
+- `MOESI_AMD_Base-dir.sm` no longer contains `dir MemData-debug`,
+  `dir B-debug`, or `dbg_b_*` actions/calls.
+- The structural SDMA atomic path tests still pass after cleanup.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the temporary Directory markers were no longer needed after the
+  successful `HIP_MEMCPY_PRELOAD_PASSED` rerun.
+- Accepted: removing the markers does not alter the intended SDMA atomic data
+  path.
+
+Files changed:
+
+- `src/mem/ruby/SConscript`
+- `src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document
+
+Verification completed:
+
+- Focused pyunit checks passed.
+- `git diff --check` completed without whitespace errors.
+
+Single next diagnostic step: after rebuilding gem5, rerun
+`hipMemcpy` preload without `RubyDirSDMADebug` in `--debug-flags`; expected
+result remains `HIP_MEMCPY_PRELOAD_PASSED` and normal `m5_exit`.
+
+Follow-up quiet verification result:
+
+The user rebuilt gem5 and reran into the same directory with
+`RubyDirSDMADebug` removed from `--debug-flags`:
+
+`m5out-hip-api-memcpy-preload-bdebug`
+
+Commands run by Codex:
+
+```bash
+ps -C gem5.opt -o pid,etime,time,pcpu,stat,args
+find m5out-hip-api-memcpy-preload-bdebug -maxdepth 1 -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n' | sort
+tail -80 m5out-hip-api-memcpy-preload-bdebug/simout.txt
+tail -160 m5out-hip-api-memcpy-preload-bdebug/simerr.txt
+rg -n "HIP_MEMCPY_PRELOAD_PASSED|Exiting @|SDMA atomic ADD64|via Ruby atomic|SDMA queue 2 drained|RubyDirSDMADebug|dir MemData-debug|dir B-debug|Invalid transition|panic|fatal|assert|B \\+ MemData" m5out-hip-api-memcpy-preload-bdebug/simout.txt m5out-hip-api-memcpy-preload-bdebug/simerr.txt m5out-hip-api-memcpy-preload-bdebug/hip-api-memcpy-preload.trace
+rg -n "^simTicks|^finalTick|^hostSeconds|^hostTickRate|^simSeconds|^simInsts|^simOps" m5out-hip-api-memcpy-preload-bdebug/stats.txt
+```
+
+First relevant observable result:
+
+```text
+HIP_MEMCPY_PRELOAD_PASSED
+Exiting @ tick 47173424022 because m5_exit instruction encountered.
+```
+
+Key trace evidence:
+
+```text
+47149459345: board.gpus0.se_sdma_engine: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ae88 src 0xffffffffffffffff via Ruby atomic
+47149600537: board.gpus0.se_sdma_engine: SDMA queue 2 drained at rptr 84
+47159994133: board.gpus0.se_sdma_engine: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ae88 src 0xffffffffffffffff via Ruby atomic
+47160113014: board.gpus0.se_sdma_engine: SDMA queue 2 drained at rptr 168
+```
+
+Facts confirmed:
+
+- The command line uses:
+  `--debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp`.
+- `RubyDirSDMADebug` is no longer requested in the run command.
+- The quiet preload smoke completed and printed `HIP_MEMCPY_PRELOAD_PASSED`.
+- The simulation exited normally via `m5_exit` at tick `47173424022`.
+- Both queue-2 SDMA signal atomics used the single Ruby atomic path and drained.
+- No `RubyDirSDMADebug`, `dir MemData-debug`, or `dir B-debug` marker appeared
+  in the inspected trace.
+- No `panic`, `fatal`, `assert`, or invalid transition appeared in the
+  inspected stdout/stderr/trace output.
+
+Hypotheses accepted or rejected:
+
+- Accepted: removing the temporary Directory debug instrumentation did not
+  regress the `hipMemcpy` preload path.
+- Accepted: the quiet functional path is stable for this smoke.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, stats, and command line for
+  the quiet successful rerun.
+
+Single next diagnostic step: prepare the SDMA/HIP API compatibility changes for
+commit by reviewing the tracked diff and excluding generated binaries, logs,
+and dependency directories from the commit set.

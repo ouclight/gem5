@@ -130,6 +130,9 @@ DmaPort::DmaReqState::createPacket()
 {
     RequestPtr req = std::make_shared<Request>(
             gen.addr(), gen.size(), flags, id);
+    if (atomicOp) {
+        req->setAtomicOpFunctor(AtomicOpFunctorPtr(atomicOp->clone()));
+    }
     if (sid.has_value()) {
         req->setStreamId(sid.value());
     }
@@ -196,6 +199,15 @@ DmaPort::dmaAction(Packet::Command cmd, Addr addr, int size, Event *event,
                    std::optional<uint32_t> ssid, Tick delay,
                    Request::Flags flag)
 {
+    dmaAction(cmd, addr, size, event, data, sid, ssid, delay, flag, nullptr);
+}
+
+void
+DmaPort::dmaAction(Packet::Command cmd, Addr addr, int size, Event *event,
+                   uint8_t *data, std::optional<uint32_t> sid,
+                   std::optional<uint32_t> ssid, Tick delay,
+                   Request::Flags flag, AtomicOpFunctorPtr atomic_op)
+{
     DPRINTF(DMA, "Starting DMA for addr: %#x size: %d sched: %d\n", addr, size,
             event ? event->scheduled() : -1);
 
@@ -204,7 +216,8 @@ DmaPort::dmaAction(Packet::Command cmd, Addr addr, int size, Event *event,
     // i.e. cache line size.
     transmitList.push_back(
             new DmaReqState(cmd, addr, cacheLineSize, size,
-                data, flag, requestorId, sid, ssid, event, delay));
+                data, flag, requestorId, sid, ssid, event, delay,
+                std::move(atomic_op)));
 
     // In zero time, also initiate the sending of the packets for the request
     // we have just created. For atomic this involves actually completing all

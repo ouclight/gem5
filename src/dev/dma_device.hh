@@ -45,6 +45,7 @@
 #include <optional>
 #include <memory>
 
+#include "base/amo.hh"
 #include "base/addr_range_map.hh"
 #include "base/chunk_generator.hh"
 #include "base/circlebuf.hh"
@@ -120,13 +121,19 @@ class DmaPort : public RequestPort, public Drainable
         /** Command for the request. */
         const Packet::Command cmd;
 
+        /** Optional atomic operation for SwapReq-style DMA atomics. */
+        AtomicOpFunctorPtr atomicOp;
+
         DmaReqState(Packet::Command _cmd, Addr addr, Addr chunk_sz, Addr tb,
                     uint8_t *_data, Request::Flags _flags, RequestorID _id,
                     std::optional<uint32_t> _sid, std::optional<uint32_t> _ssid,
-                    Event *ce, Tick _delay, Event *ae=nullptr)
+                    Event *ce, Tick _delay,
+                    AtomicOpFunctorPtr _atomic_op=nullptr,
+                    Event *ae=nullptr)
             : completionEvent(ce), abortEvent(ae), totBytes(tb), delay(_delay),
               gen(addr, tb, chunk_sz), data(_data), flags(_flags), id(_id),
-              sid(_sid), ssid(_ssid), cmd(_cmd)
+              sid(_sid), ssid(_ssid), cmd(_cmd),
+              atomicOp(std::move(_atomic_op))
         {}
 
         PacketPtr createPacket();
@@ -209,6 +216,12 @@ class DmaPort : public RequestPort, public Drainable
               uint8_t *data, std::optional<uint32_t> sid,
               std::optional<uint32_t> ssid, Tick delay, Request::Flags flag=0);
 
+    void
+    dmaAction(Packet::Command cmd, Addr addr, int size, Event *event,
+              uint8_t *data, std::optional<uint32_t> sid,
+              std::optional<uint32_t> ssid, Tick delay,
+              Request::Flags flag, AtomicOpFunctorPtr atomic_op);
+
     // Abort and remove any pending DMA transmissions.
     void abortPending();
 
@@ -255,6 +268,15 @@ class DmaDevice : public PioDevice
     dmaRead(Addr addr, int size, Event *event, uint8_t *data, Tick delay=0)
     {
         dmaPort.dmaAction(MemCmd::ReadReq, addr, size, event, data, delay);
+    }
+
+    void
+    dmaAtomic(Addr addr, int size, Event *event, uint8_t *data,
+              AtomicOpFunctorPtr atomic_op, Tick delay=0)
+    {
+        dmaPort.dmaAction(MemCmd::SwapReq, addr, size, event, data,
+                          std::nullopt, std::nullopt, delay,
+                          Request::ATOMIC_RETURN_OP, std::move(atomic_op));
     }
 
     bool dmaPending() const { return dmaPort.dmaPending(); }

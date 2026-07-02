@@ -296,6 +296,12 @@ DMASequencer::atomicCallback(const DataBlock& dblk, const Addr& address)
     memcpy(pkt->getPtr<uint8_t>(), dblk.getData(offset, pkt->getSize()),
            pkt->getSize());
 
+    // Ruby has already applied the atomic operation to the cache line.  Convert
+    // the packet to a normal write carrying the post-atomic value so
+    // RubyPort::hitCallback updates the access_backing_store memory exactly
+    // once without re-executing the non-idempotent atomic operation.
+    pkt->cmd = MemCmd::WriteReq;
+
     ruby_hit_callback(pkt);
 
     m_outstanding_count--;
