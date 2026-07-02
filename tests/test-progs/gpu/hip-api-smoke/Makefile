@@ -10,6 +10,10 @@ MALLOC_SMOKE_TARGET := hip_malloc_smoke
 MALLOC_SMOKE_SRC := hip_malloc_smoke.hip
 MEMCPY_PRELOAD_SMOKE_TARGET := hip_memcpy_preload_smoke
 MEMCPY_PRELOAD_SMOKE_SRC := hip_memcpy_preload_smoke.hip
+HIP_LIFECYCLE_PRELOAD_SMOKE_TARGET := hip_lifecycle_preload_smoke
+HIP_LIFECYCLE_PRELOAD_SMOKE_SRC := hip_lifecycle_preload_smoke.hip
+HIP_FREE_SMOKE_TARGET := hip_free_smoke
+HIP_FREE_SMOKE_SRC := hip_free_smoke.hip
 M5OP_SRC := $(GEM5_ROOT)/util/m5/src/abi/x86/m5op.S
 M5OP_OBJ := m5op_x86.o
 M5OP_LIB := libm5op_x86.a
@@ -22,7 +26,8 @@ endif
 .PHONY: all clean
 
 all: $(TARGET) $(PRELOAD_SMOKE_TARGET) $(MALLOC_SMOKE_TARGET) \
-	$(MEMCPY_PRELOAD_SMOKE_TARGET)
+	$(MEMCPY_PRELOAD_SMOKE_TARGET) $(HIP_LIFECYCLE_PRELOAD_SMOKE_TARGET) \
+	$(HIP_FREE_SMOKE_TARGET)
 
 $(TARGET): $(SRC)
 	$(HIPCC) $(HIPCCFLAGS) -O2 --offload-arch=gfx900 -o $@ $<
@@ -39,6 +44,15 @@ $(MEMCPY_PRELOAD_SMOKE_TARGET): $(MEMCPY_PRELOAD_SMOKE_SRC) $(M5OP_LIB)
 	$(HIPCC) $(HIPCCFLAGS) -O2 --offload-arch=gfx900 \
 		-I$(GEM5_ROOT)/include -o $@ $< -L. -lm5op_x86
 
+$(HIP_LIFECYCLE_PRELOAD_SMOKE_TARGET): \
+		$(HIP_LIFECYCLE_PRELOAD_SMOKE_SRC) $(M5OP_LIB)
+	$(HIPCC) $(HIPCCFLAGS) -O2 --offload-arch=gfx900 \
+		-I$(GEM5_ROOT)/include -o $@ $< -L. -lm5op_x86
+
+$(HIP_FREE_SMOKE_TARGET): $(HIP_FREE_SMOKE_SRC) $(M5OP_LIB)
+	$(HIPCC) $(HIPCCFLAGS) -O2 --offload-arch=gfx900 \
+		-I$(GEM5_ROOT)/include -o $@ $< -L. -lm5op_x86
+
 $(M5OP_OBJ): $(M5OP_SRC)
 	$(CC) -I$(GEM5_ROOT)/include -c -o $@ $<
 
@@ -47,4 +61,6 @@ $(M5OP_LIB): $(M5OP_OBJ)
 
 clean:
 	$(RM) $(TARGET) $(PRELOAD_SMOKE_TARGET) $(MALLOC_SMOKE_TARGET) \
-		$(MEMCPY_PRELOAD_SMOKE_TARGET) $(M5OP_OBJ) $(M5OP_LIB)
+		$(MEMCPY_PRELOAD_SMOKE_TARGET) \
+		$(HIP_LIFECYCLE_PRELOAD_SMOKE_TARGET) \
+		$(HIP_FREE_SMOKE_TARGET) $(M5OP_OBJ) $(M5OP_LIB)

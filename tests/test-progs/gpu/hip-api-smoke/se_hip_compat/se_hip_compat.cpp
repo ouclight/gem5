@@ -466,3 +466,17 @@ hipMemcpy(void *dst, const void *src, size_t sizeBytes, hipMemcpyKind kind)
     }
     return realHipMemcpy(dst, src, sizeBytes, kind);
 }
+
+extern "C" hipError_t
+hipFree(void *ptr)
+{
+    if (ptr == nullptr) {
+        return hipSuccess;
+    }
+
+    std::fprintf(
+        stderr,
+        "[se_hip_compat] hipFree shim: skip ROCm free path for %p\n",
+        ptr);
+    return hipSuccess;
+}

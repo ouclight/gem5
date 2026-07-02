@@ -57,6 +57,79 @@ def _load_worktree_se_viper_board():
 
 
 class SEViperMultiGPUTest(unittest.TestCase):
+    def test_hip_free_smoke_isolates_malloc_free_sequence(self):
+        source_path = Path(
+            "tests/test-progs/gpu/hip-api-smoke/hip_free_smoke.hip"
+        )
+        makefile = Path(
+            "tests/test-progs/gpu/hip-api-smoke/Makefile"
+        ).read_text()
+
+        self.assertIn("HIP_FREE_SMOKE_TARGET", makefile)
+        self.assertIn("hip_free_smoke", makefile)
+        self.assertTrue(source_path.exists())
+
+        source = source_path.read_text()
+        required_markers = [
+            "hipSetDevice(0)",
+            "hipMalloc(&device_data, bytes)",
+            "hipFree(device_data)",
+            "HIP_FREE_PASSED",
+            "m5_exit(0)",
+        ]
+        previous = -1
+        for marker in required_markers:
+            position = source.find(marker)
+            self.assertNotEqual(position, -1, marker)
+            self.assertGreater(position, previous, marker)
+            previous = position
+
+    def test_se_hip_compat_shims_hip_free_without_entering_rocm_free_path(self):
+        source = Path(
+            "tests/test-progs/gpu/hip-api-smoke/se_hip_compat/"
+            "se_hip_compat.cpp"
+        ).read_text()
+
+        self.assertIn('extern "C" hipError_t\nhipFree(void *ptr)', source)
+        self.assertIn("[se_hip_compat] hipFree shim", source)
+        self.assertIn("return hipSuccess", source)
+        hip_free_impl = source[
+            source.index("hipFree(void *ptr)"):
+        ]
+        self.assertNotIn('dlsym(RTLD_NEXT, "hipFree")', hip_free_impl)
+        self.assertNotIn("RealHipFree", hip_free_impl)
+
+    def test_hip_lifecycle_preload_smoke_combines_core_api_sequence(self):
+        source_path = Path(
+            "tests/test-progs/gpu/hip-api-smoke/"
+            "hip_lifecycle_preload_smoke.hip"
+        )
+        makefile = Path(
+            "tests/test-progs/gpu/hip-api-smoke/Makefile"
+        ).read_text()
+
+        self.assertIn("HIP_LIFECYCLE_PRELOAD_SMOKE_TARGET", makefile)
+        self.assertIn("hip_lifecycle_preload_smoke", makefile)
+        self.assertTrue(source_path.exists())
+
+        source = source_path.read_text()
+        required_markers = [
+            "hipSetDevice(0)",
+            "hipMalloc(&device_data, bytes)",
+            "hipMemset(device_data, memset_byte, bytes)",
+            "hipMemcpy(device_data, host_input",
+            "hipMemcpy(host_output, device_data",
+            "hipFree(device_data)",
+            "HIP_LIFECYCLE_PRELOAD_PASSED",
+            "m5_exit(0)",
+        ]
+        previous = -1
+        for marker in required_markers:
+            position = source.find(marker)
+            self.assertNotEqual(position, -1, marker)
+            self.assertGreater(position, previous, marker)
+            previous = position
+
     def test_directory_b_state_debug_instrumentation_removed_after_sdma_fix(self):
         protocol = Path(
             "src/mem/ruby/protocol/MOESI_AMD_Base-dir.sm"

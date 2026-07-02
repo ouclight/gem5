@@ -16676,3 +16676,631 @@ Verification completed:
 Single next diagnostic step: prepare the SDMA/HIP API compatibility changes for
 commit by reviewing the tracked diff and excluding generated binaries, logs,
 and dependency directories from the commit set.
+
+## 2026-07-02 HIP memset preload quiet verification
+
+After the SDMA/HIP API compatibility changes were committed and pushed, the
+user reran the HIP memset preload smoke without the verbose Ruby Directory
+debug flag.
+
+Output directory:
+
+`m5out-hip-api-memset-preload-quiet`
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/systematic-debugging/SKILL.md
+sed -n '1,180p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/verification-before-completion/SKILL.md
+sed -n '1,260p' docs/debug/se-multigpu-status.md
+git status --short
+git diff -- docs/debug/se-multigpu-status.md src tests configs
+find m5out-hip-api-memset-preload-quiet -maxdepth 1 -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n' | sort
+tail -120 m5out-hip-api-memset-preload-quiet/simout.txt
+tail -220 m5out-hip-api-memset-preload-quiet/simerr.txt
+rg -n "HIP_MEMSET_PRELOAD|PASSED|FAILED|mismatch|panic|fatal|assert|Invalid transition|SDMA atomic|HSA AQL Kernel Complete|GPU Blit Kernel Completed|Exiting @ tick" m5out-hip-api-memset-preload-quiet/simout.txt m5out-hip-api-memset-preload-quiet/simerr.txt m5out-hip-api-memset-preload-quiet/hip-api-memset-preload.trace
+rg -n "finalTick|simTicks|hostSeconds|numCycles|system.cpu|board.processor" m5out-hip-api-memset-preload-quiet/stats.txt | tail -80
+```
+
+Run command recorded by `simout.txt`:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hip-api-memset-preload-quiet -r -e \
+  --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off \
+  --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp \
+  --debug-file=hip-api-memset-preload.trace \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing \
+  --app tests/test-progs/gpu/hip-api-smoke/hip_memset_preload_smoke \
+  --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  --env LD_PRELOAD=/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke/se_hip_compat/libse_hip_compat.so \
+  --env SE_HIP_MEMSET_HSACO=/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_memset.hsaco \
+  --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu \
+  --env HSA_ENABLE_SDMA=1
+```
+
+First relevant observable result:
+
+```text
+GPU Blit Kernel Completed dump and reset
+GPU Blit Kernel Completed dump and reset
+HIP_MEMSET_PRELOAD_PASSED
+Exiting @ tick 45904922460 because m5_exit instruction encountered.
+```
+
+Key trace evidence:
+
+```text
+45755926272: board.gpus0.dispatcher: HSA AQL Kernel Complete with completion signal! Addr: 140728611613952
+45875309103: board.gpus0.dispatcher: HSA AQL Kernel Complete with completion signal! Addr: 140728611613568
+```
+
+Facts confirmed:
+
+- `hip_memset_preload_smoke` completed with `HIP_MEMSET_PRELOAD_PASSED`.
+- The simulation exited normally by `m5_exit` at tick `45904922460`.
+- The run used the quiet debug set:
+  `GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp`.
+- The memset preload path completed two AQL kernels and printed two
+  `GPU Blit Kernel Completed` markers.
+- No `panic`, `fatal`, `assert`, `Invalid transition`, `FAILED`, or `mismatch`
+  appeared in the inspected stdout/stderr/trace.
+- No SDMA atomic marker was observed in this trace; this is expected for the
+  current memset preload path, which uses a kernel/blit path rather than the
+  SDMA copy-completion atomic path exercised by `hipMemcpy` preload.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the current preload implementation is sufficient for the
+  `hipMemset` functional smoke under Timing CPU in the quiet debug
+  configuration.
+- Rejected for this run: `hipMemset` requires the SE SDMA packet path to pass;
+  the observed completion path is AQL kernel/blit based.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, stats, and command line for
+  the quiet `hipMemset` preload run.
+
+Single next diagnostic step: continue HIP API compatibility validation with a
+small lifecycle/API smoke that combines native `hipMalloc`, preload
+`hipMemset`, preload `hipMemcpy` H2D/D2H, result validation, and `hipFree`, so
+the next failure can be localized to allocation, memset, copy, or free rather
+than tested as isolated APIs only.
+
+## 2026-07-02 HIP lifecycle preload smoke implementation
+
+The user accepted the next step to add a combined HIP API lifecycle smoke for
+continued compatibility validation.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/test-driven-development/SKILL.md
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/systematic-debugging/SKILL.md
+rg -n "hip-api|preload|lifecycle|hipMemcpy|hipMemset|SE SDMA|launch-acquire" /home/zhangds/.codex/memories/MEMORY.md
+sed -n '1,220p' AGENTS.md
+sed -n '16620,16820p' docs/debug/se-multigpu-status.md
+git status --short
+find tests/test-progs/gpu/hip-api-smoke -maxdepth 2 -type f | sort
+sed -n '1,260p' tests/test-progs/gpu/hip-api-smoke/Makefile
+sed -n '1,280p' tests/test-progs/gpu/hip-api-smoke/hip_memcpy_preload_smoke.hip
+sed -n '1,280p' tests/test-progs/gpu/hip-api-smoke/hip_memset_preload_smoke.hip
+sed -n '1,220p' tests/test-progs/gpu/hip-api-smoke/hip_malloc_smoke.hip
+sed -n '1,320p' tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_compat.cpp
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_lifecycle_preload_smoke_combines_core_api_sequence
+make -C tests/test-progs/gpu/hip-api-smoke ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 hip_lifecycle_preload_smoke
+make -C tests/test-progs/gpu/hip-api-smoke HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 hip_lifecycle_preload_smoke
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_lifecycle_preload_smoke_combines_core_api_sequence test_se_viper_multigpu.SEViperMultiGPUTest.test_se_sdma_atomic_uses_single_ruby_atomic_request test_se_viper_multigpu.SEViperMultiGPUTest.test_directory_b_state_debug_instrumentation_removed_after_sdma_fix
+git diff --check
+git status --short
+```
+
+TDD RED result:
+
+```text
+FAIL: test_hip_lifecycle_preload_smoke_combines_core_api_sequence
+AssertionError: 'HIP_LIFECYCLE_PRELOAD_SMOKE_TARGET' not found
+```
+
+First implementation build result:
+
+```text
+make: hipcc: Command not found
+```
+
+The source was then built with the explicit ROCm dependency `hipcc` path.
+
+Final verification results:
+
+```text
+Ran 3 tests in 0.003s
+OK
+```
+
+```text
+/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc ... -o hip_lifecycle_preload_smoke hip_lifecycle_preload_smoke.hip ...
+make: Leaving directory '/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke'
+```
+
+Facts confirmed:
+
+- Added `hip_lifecycle_preload_smoke.hip`.
+- The smoke runs this target API sequence:
+  `hipSetDevice(0)`, `hipMalloc`, `hipMemset`, validation of the memset
+  result, `hipMemcpy` H2D, `hipMemcpy` D2H, result validation, and `hipFree`.
+- The smoke prints flushed begin/end phase markers for each major API so a
+  future simulation hang can be localized from `simout.txt`.
+- The smoke prints `HIP_LIFECYCLE_PRELOAD_PASSED` and calls `m5_exit(0)` on
+  success.
+- The Makefile now builds `hip_lifecycle_preload_smoke` as part of `all` and
+  removes it in `clean`.
+- The first make command failed only because `hipcc` was not on `PATH`; the
+  explicit dependency path build passed.
+
+Hypotheses accepted or rejected:
+
+- Accepted: a combined lifecycle smoke is the right next compatibility
+  baseline after isolated `hipMemset` and `hipMemcpy` preload smokes passed.
+- Rejected for this step: starting a full gem5 lifecycle simulation from Codex;
+  per repository guidance the user owns full simulation runs unless explicitly
+  delegated.
+
+Files changed:
+
+- `tests/test-progs/gpu/hip-api-smoke/Makefile`
+- `tests/test-progs/gpu/hip-api-smoke/hip_lifecycle_preload_smoke.hip`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- TDD RED focused pyunit failed before implementation.
+- Focused lifecycle pyunit passed after implementation.
+- Related SDMA atomic and temporary debug-removal pyunits passed.
+- The new HIP lifecycle smoke compiled with the explicit ROCm `hipcc` path.
+- `git diff --check` completed without whitespace errors.
+
+Single next diagnostic step: run the new lifecycle smoke under the same preload
+environment used by the successful isolated smokes. Suggested command shape:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hip-api-lifecycle-preload-quiet -r -e \
+  --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off \
+  --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp \
+  --debug-file=hip-api-lifecycle-preload.trace \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing \
+  --app tests/test-progs/gpu/hip-api-smoke/hip_lifecycle_preload_smoke \
+  --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  --env LD_PRELOAD=/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke/se_hip_compat/libse_hip_compat.so \
+  --env SE_HIP_MEMSET_HSACO=/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_memset.hsaco \
+  --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu \
+  --env HSA_ENABLE_SDMA=1
+```
+
+## 2026-07-02 HIP lifecycle preload quiet trace inspection
+
+The user ran the new lifecycle smoke in:
+
+`m5out-hip-api-lifecycle-preload-quiet`
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/systematic-debugging/SKILL.md
+rg -n "SE multi-GPU|launch-acquire|hip-api|SDMA" /home/zhangds/.codex/memories/MEMORY.md
+tail -220 docs/debug/se-multigpu-status.md
+git status --short
+git diff -- docs/debug/se-multigpu-status.md tests/test-progs/gpu/hip-api-smoke/Makefile tests/test-progs/gpu/hip-api-smoke/hip_lifecycle_preload_smoke.hip tests/pyunit/stdlib/test_se_viper_multigpu.py
+find m5out-hip-api-lifecycle-preload-quiet -maxdepth 1 -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n' | sort
+tail -160 m5out-hip-api-lifecycle-preload-quiet/simout.txt
+tail -240 m5out-hip-api-lifecycle-preload-quiet/simerr.txt
+rg -n "hip_lifecycle_preload|HIP_LIFECYCLE|PASSED|FAILED|mismatch|panic|fatal|assert|Invalid transition|SDMA queue|SDMA atomic|SDMA copy|HSA AQL Kernel Complete|GPU Blit Kernel Completed|Exiting @ tick" m5out-hip-api-lifecycle-preload-quiet/simout.txt m5out-hip-api-lifecycle-preload-quiet/simerr.txt m5out-hip-api-lifecycle-preload-quiet/hip-api-lifecycle-preload.trace
+rg -n "^finalTick|^simTicks|^hostSeconds|^hostTickRate|^simSeconds|^simInsts|^simOps" m5out-hip-api-lifecycle-preload-quiet/stats.txt
+ps -C gem5.opt -o pid,etime,time,pcpu,stat,args
+tail -140 m5out-hip-api-lifecycle-preload-quiet/hip-api-lifecycle-preload.trace
+rg -n "hipFree|hsaKmtFreeMemory|hsaKmtUnmapMemory|free|munmap|futex|sched_yield|mprotect|exit|Exiting|simulate\(\) limit|last active|m5_exit" m5out-hip-api-lifecycle-preload-quiet/simerr.txt m5out-hip-api-lifecycle-preload-quiet/simout.txt m5out-hip-api-lifecycle-preload-quiet/hip-api-lifecycle-preload.trace | tail -160
+tail -120 m5out-hip-api-lifecycle-preload-quiet/simerr.txt
+```
+
+First relevant observable result:
+
+```text
+[hip_lifecycle_preload] begin hipSetDevice(0)
+[hip_lifecycle_preload] end hipSetDevice(0)
+[hip_lifecycle_preload] begin hipMalloc
+[hip_lifecycle_preload] end hipMalloc
+[hip_lifecycle_preload] begin hipMemset
+GPU Blit Kernel Completed dump and reset
+GPU Blit Kernel Completed dump and reset
+[hip_lifecycle_preload] end hipMemset
+[hip_lifecycle_preload] begin hipMemcpy H2D
+[hip_lifecycle_preload] end hipMemcpy H2D
+[hip_lifecycle_preload] begin hipMemcpy D2H
+[hip_lifecycle_preload] end hipMemcpy D2H
+[hip_lifecycle_preload] begin hipFree
+```
+
+Key trace evidence:
+
+```text
+45754597602: board.gpus0.dispatcher: HSA AQL Kernel Complete with completion signal! Addr: 140728611613952
+45872959788: board.gpus0.dispatcher: HSA AQL Kernel Complete with completion signal! Addr: 140728611613568
+47172603844: board.gpus0.se_sdma_engine: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ab88 src 0xffffffffffffffff via Ruby atomic
+47172736711: board.gpus0.se_sdma_engine: SDMA queue 2 drained at rptr 84
+47181211561: board.gpus0.se_sdma_engine: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ab88 src 0xffffffffffffffff via Ruby atomic
+47181330442: board.gpus0.se_sdma_engine: SDMA queue 2 drained at rptr 168
+```
+
+Facts confirmed:
+
+- `hipSetDevice`, native `hipMalloc`, preload `hipMemset`, preload
+  `hipMemcpy` H2D, and preload `hipMemcpy` D2H all reached their end markers.
+- The H2D and D2H copies each completed their SDMA queue 2 completion signal
+  atomic through the single Ruby atomic path.
+- `simout.txt` stops at `[hip_lifecycle_preload] begin hipFree`.
+- There is no `[hip_lifecycle_preload] end hipFree`.
+- There is no `HIP_LIFECYCLE_PRELOAD_PASSED` and no normal `Exiting @ tick`
+  line.
+- `ps -C gem5.opt` showed no running gem5 process when inspected.
+- No `panic`, `fatal`, `assert`, `Invalid transition`, `FAILED`, or `mismatch`
+  appeared in the inspected stdout/stderr/trace.
+- `stats.txt` contains the two blit-kernel dump sections but no final normal
+  exit stats section from `m5_exit`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the lifecycle smoke currently localizes the remaining problem to
+  native `hipFree` or runtime teardown triggered by `hipFree`, not to
+  `hipMemset` or `hipMemcpy`.
+- Accepted: the current SDMA copy path remains functional in this combined
+  smoke.
+- Rejected for this run: the lifecycle failure is caused by a Ruby protocol
+  panic or SDMA completion-signal atomic regression; no evidence supports
+  either in this trace.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, stats, file timestamps, and
+  process status for the lifecycle run.
+
+Single next diagnostic step: isolate `hipFree` with a smaller smoke
+(`hipSetDevice -> hipMalloc -> hipFree -> m5_exit`) using the same environment.
+If native `hipFree` also stalls, inspect ROCm 4.0.1 `hipFree`/KFD free path and
+consider a scoped `LD_PRELOAD` `hipFree` compatibility shim for SE-mode device
+allocations.
+
+## 2026-07-02 HIP free isolation smoke implementation
+
+The user accepted the next step to isolate native `hipFree`.
+
+Commands run by Codex:
+
+```bash
+sed -n '1,220p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/test-driven-development/SKILL.md
+sed -n '1,180p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/systematic-debugging/SKILL.md
+rg -n "SE multi-GPU|launch-acquire|hip-api|SDMA" /home/zhangds/.codex/memories/MEMORY.md
+tail -260 docs/debug/se-multigpu-status.md
+git status --short
+git diff -- tests/test-progs/gpu/hip-api-smoke/Makefile tests/test-progs/gpu/hip-api-smoke/hip_lifecycle_preload_smoke.hip tests/pyunit/stdlib/test_se_viper_multigpu.py docs/debug/se-multigpu-status.md
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_free_smoke_isolates_malloc_free_sequence
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_free_smoke_isolates_malloc_free_sequence test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_lifecycle_preload_smoke_combines_core_api_sequence
+make -C tests/test-progs/gpu/hip-api-smoke HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 hip_free_smoke
+```
+
+TDD RED result:
+
+```text
+FAIL: test_hip_free_smoke_isolates_malloc_free_sequence
+AssertionError: 'HIP_FREE_SMOKE_TARGET' not found
+```
+
+Final verification results:
+
+```text
+Ran 2 tests in 0.001s
+OK
+```
+
+```text
+/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc ... -o hip_free_smoke hip_free_smoke.hip ...
+make: Leaving directory '/home/zhangds/gem5/tests/test-progs/gpu/hip-api-smoke'
+```
+
+Facts confirmed:
+
+- Added `hip_free_smoke.hip`.
+- The smoke isolates the target API sequence:
+  `hipSetDevice(0)`, `hipMalloc`, `hipFree`, then `m5_exit(0)`.
+- The smoke prints flushed begin/end phase markers for each API so a future
+  simulation can distinguish a `hipMalloc` failure from a `hipFree` stall.
+- The smoke prints `HIP_FREE_PASSED` on success.
+- The Makefile now builds `hip_free_smoke` as part of `all` and removes it in
+  `clean`.
+
+Hypotheses accepted or rejected:
+
+- Accepted: a minimal native `hipFree` isolation smoke is required before
+  proposing any `hipFree` shim or ROCm/KFD free-path fix.
+- Rejected for this implementation step: changing runtime behavior before
+  confirming whether `hipFree` fails independently of memset/memcpy.
+
+Files changed:
+
+- `tests/test-progs/gpu/hip-api-smoke/Makefile`
+- `tests/test-progs/gpu/hip-api-smoke/hip_free_smoke.hip`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- TDD RED focused pyunit failed before implementation.
+- Focused `hipFree` and lifecycle structural pyunits passed after
+  implementation.
+- The new `hip_free_smoke` binary compiled with the explicit ROCm `hipcc`
+  path.
+
+Single next diagnostic step: run `hip_free_smoke` under the same ROCm path and
+quiet debug environment. Suggested command:
+
+```bash
+build/VEGA_X86/gem5.opt -d m5out-hip-api-free-native-quiet -r -e \
+  --stdout-file=simout.txt --stderr-file=simerr.txt --listener-mode=off \
+  --debug-flags=GPUDriver,HSAPacketProcessor,SESDMAEngine,GPUDisp,GPUAgentDisp \
+  --debug-file=hip-api-free-native.trace \
+  configs/example/gem5_library/x86-vega-xgmi-multigpu-se.py --cpu-type timing \
+  --app tests/test-progs/gpu/hip-api-smoke/hip_free_smoke \
+  --rocm-path /home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 \
+  --env LD_LIBRARY_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib:/usr/lib/x86_64-linux-gnu
+```
+
+## 2026-07-02 Native hipFree isolation result and SE compat shim
+
+The user ran the native `hip_free_smoke` in:
+
+`m5out-hip-api-free-native-quiet`
+
+Commands run by Codex:
+
+```bash
+sed -n '1,180p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/systematic-debugging/SKILL.md
+tail -220 docs/debug/se-multigpu-status.md
+git status --short
+find m5out-hip-api-free-native-quiet -maxdepth 1 -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n' | sort
+rg -n "SE multi-GPU|hip-api|SDMA" /home/zhangds/.codex/memories/MEMORY.md
+tail -120 m5out-hip-api-free-native-quiet/simout.txt
+tail -220 m5out-hip-api-free-native-quiet/simerr.txt
+tail -180 m5out-hip-api-free-native-quiet/hip-api-free-native.trace
+rg -n "hip_free_smoke|HIP_FREE|PASSED|FAILED|mismatch|panic|fatal|assert|Invalid transition|hipFree|hsaKmtFreeMemory|hsaKmtUnmapMemory|AMDKFD_IOC_FREE_MEMORY|free arguments|Exiting @ tick|simulate\(\) limit|m5_exit|exit" m5out-hip-api-free-native-quiet/simout.txt m5out-hip-api-free-native-quiet/simerr.txt m5out-hip-api-free-native-quiet/hip-api-free-native.trace
+ps -C gem5.opt -o pid,etime,time,pcpu,stat,args
+find .deps -maxdepth 4 -type d \( -iname '*rocm*' -o -iname '*hip*' -o -iname '*rocr*' -o -iname '*clr*' \) | sort | head -120
+rg -n "hipFree\(|ihipFree|hip_free|FreeMemory|hsaKmtFreeMemory|AMDKFD_IOC_FREE_MEMORY" .deps tests src -g'*.cpp' -g'*.cc' -g'*.h' -g'*.hpp' -g'*.c' 2>/dev/null | head -200
+nm -D .deps/rocm-4.0.1/root/opt/rocm-4.0.1/lib/libamdhip64.so.4 2>/dev/null | rg "hipFree|hipMalloc|hipMemcpy|hipMemset"
+rg -n "hsaKmtFreeMemory|AMDKFD_IOC_FREE_MEMORY|FREE_MEMORY|free arguments|Unregistering" src/gpu-compute src -g'*.cc' -g'*.hh' -g'*.py'
+sed -n '1,220p' tests/test-progs/gpu/hip-api-smoke/se_hip_compat/Makefile
+sed -n '1,140p' tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_compat.cpp
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_se_hip_compat_shims_hip_free_without_entering_rocm_free_path
+build/VEGA_X86/gem5.opt -p tests/pyunit/stdlib -m unittest test_se_viper_multigpu.SEViperMultiGPUTest.test_se_hip_compat_shims_hip_free_without_entering_rocm_free_path test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_free_smoke_isolates_malloc_free_sequence test_se_viper_multigpu.SEViperMultiGPUTest.test_hip_lifecycle_preload_smoke_combines_core_api_sequence
+make -C tests/test-progs/gpu/hip-api-smoke/se_hip_compat CXX=g++ HIPCC=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1/hip/bin/hipcc ROCM_PATH=/home/zhangds/gem5/.deps/rocm-4.0.1/root/opt/rocm-4.0.1 libse_hip_compat.so
+nm -D tests/test-progs/gpu/hip-api-smoke/se_hip_compat/libse_hip_compat.so | rg " hipFree$| hipMemcpy$| hipMemset$"
+```
+
+Native isolation result:
+
+```text
+[hip_free_smoke] begin hipSetDevice(0)
+[hip_free_smoke] end hipSetDevice(0)
+[hip_free_smoke] begin hipMalloc
+[hip_free_smoke] end hipMalloc
+[hip_free_smoke] begin hipFree
+Exiting @ tick 77168036718 because user interrupt received.
+```
+
+Facts confirmed:
+
+- Native `hipFree` stalls independently in the minimal smoke.
+- `stats.txt` was zero bytes, and the run did not reach `m5_exit`.
+- No `AMDKFD_IOC_FREE_MEMORY_OF_GPU`, `hsaKmtFreeMemory`, or KFD
+  `free arguments` marker appeared after `begin hipFree` in the inspected
+  output.
+- The stall therefore occurs inside ROCm HIP/runtime code before entering the
+  gem5 KFD free ioctl path.
+- The `.deps` ROCm install contains headers and libraries but no full HIP/CLR
+  implementation source tree sufficient to directly inspect `ihipFree`.
+- Added an SE compatibility-layer `hipFree` shim in `libse_hip_compat.so` that
+  returns `hipSuccess` for non-null pointers without calling `RTLD_NEXT`
+  `hipFree`.
+- The shim is intentionally scoped to the preload compatibility library; it is
+  a short-program SE compatibility workaround and leaks the target device
+  allocation instead of exercising ROCm's native free path.
+
+Final verification results:
+
+```text
+Ran 3 tests in 0.002s
+OK
+```
+
+```text
+0000000000002870 T hipFree
+0000000000002b70 T hipMemcpy
+00000000000028b0 T hipMemset
+```
+
+Hypotheses accepted or rejected:
+
+- Accepted: native `hipFree` is currently not usable in this SE configuration.
+- Accepted: the practical compatibility path for now is to bypass native
+  `hipFree` under `LD_PRELOAD`.
+- Rejected: the observed `hipFree` stall is caused by gem5's
+  `AMDKFD_IOC_FREE_MEMORY_OF_GPU` handler; the ioctl is not reached.
+
+Files changed:
+
+- `tests/test-progs/gpu/hip-api-smoke/se_hip_compat/se_hip_compat.cpp`
+- `tests/pyunit/stdlib/test_se_viper_multigpu.py`
+- this status document.
+
+Verification completed:
+
+- TDD RED focused pyunit failed before the shim existed.
+- Focused shim/free/lifecycle pyunits passed after the shim.
+- `libse_hip_compat.so` rebuilt successfully.
+- `nm -D` confirmed that the rebuilt preload library exports `hipFree`,
+  `hipMemcpy`, and `hipMemset`.
+
+Single next diagnostic step: rerun `hip_free_smoke` with `LD_PRELOAD` pointing
+to the rebuilt `libse_hip_compat.so`; expected result is
+`HIP_FREE_PASSED` and normal `m5_exit`. Then rerun the lifecycle preload smoke
+to confirm the previous `begin hipFree` stall is removed.
+
+## 2026-07-02 HIP free preload shim verification
+
+The user reran `hip_free_smoke` with the rebuilt preload library in:
+
+`m5out-hip-api-free-preload-quiet`
+
+Commands run by Codex:
+
+```bash
+sed -n '1,140p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/verification-before-completion/SKILL.md
+tail -180 docs/debug/se-multigpu-status.md
+git status --short
+find m5out-hip-api-free-preload-quiet -maxdepth 1 -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n' | sort
+tail -120 m5out-hip-api-free-preload-quiet/simout.txt
+tail -180 m5out-hip-api-free-preload-quiet/simerr.txt
+rg -n "hip_free_smoke|HIP_FREE_PASSED|se_hip_compat.*hipFree|end hipFree|begin hipFree|panic|fatal|assert|Invalid transition|Exiting @ tick|AMDKFD_IOC_FREE_MEMORY|hsaKmtFreeMemory|free arguments" m5out-hip-api-free-preload-quiet/simout.txt m5out-hip-api-free-preload-quiet/simerr.txt m5out-hip-api-free-preload-quiet/hip-api-free-preload.trace
+rg -n "^finalTick|^simTicks|^hostSeconds|^hostTickRate|^simSeconds|^simInsts|^simOps" m5out-hip-api-free-preload-quiet/stats.txt
+```
+
+First relevant observable result:
+
+```text
+[hip_free_smoke] begin hipFree
+[hip_free_smoke] end hipFree
+HIP_FREE_PASSED
+Exiting @ tick 44055423477 because m5_exit instruction encountered.
+```
+
+Shim evidence:
+
+```text
+[se_hip_compat] hipFree shim: skip ROCm free path for 0x7ffdee800000
+```
+
+Facts confirmed:
+
+- `hip_free_smoke` with `LD_PRELOAD=libse_hip_compat.so` completed.
+- The run reached `end hipFree`, printed `HIP_FREE_PASSED`, and exited through
+  `m5_exit`.
+- `finalTick` equals `44055423477`.
+- The shim log confirms the preload `hipFree` implementation was used.
+- No `panic`, `fatal`, `assert`, `Invalid transition`, `AMDKFD_IOC_FREE_MEMORY`,
+  `hsaKmtFreeMemory`, or KFD `free arguments` markers appeared in the inspected
+  output.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the preload `hipFree` shim removes the isolated `hipFree` stall.
+- Accepted: native ROCm `hipFree` is bypassed before entering the KFD free path.
+- Still to verify: whether the same shim removes the lifecycle smoke's previous
+  `begin hipFree` stall after `hipMemset` and H2D/D2H `hipMemcpy`.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, stats, and command line for
+  the preload `hipFree` run.
+
+Single next diagnostic step: rerun `hip_lifecycle_preload_smoke` with the same
+rebuilt `libse_hip_compat.so`; expected result is
+`HIP_LIFECYCLE_PRELOAD_PASSED` and normal `m5_exit`.
+
+## 2026-07-02 HIP lifecycle preload shim verification
+
+The user reran `hip_lifecycle_preload_smoke` with the rebuilt preload library
+in:
+
+`m5out-hip-api-lifecycle-preload-shim-quiet`
+
+Commands run by Codex:
+
+```bash
+sed -n '1,140p' /home/zhangds/.codex/plugins/cache/openai-curated/superpowers/3fdeeb49/skills/verification-before-completion/SKILL.md
+tail -180 docs/debug/se-multigpu-status.md
+git status --short
+find m5out-hip-api-lifecycle-preload-shim-quiet -maxdepth 1 -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS %s %p\n' | sort
+tail -140 m5out-hip-api-lifecycle-preload-shim-quiet/simout.txt
+tail -220 m5out-hip-api-lifecycle-preload-shim-quiet/simerr.txt
+rg -n "hip_lifecycle_preload|HIP_LIFECYCLE_PRELOAD_PASSED|se_hip_compat.*hipFree|end hipFree|begin hipFree|panic|fatal|assert|Invalid transition|FAILED|mismatch|Exiting @ tick|SDMA atomic|SDMA queue|HSA AQL Kernel Complete|GPU Blit Kernel Completed" m5out-hip-api-lifecycle-preload-shim-quiet/simout.txt m5out-hip-api-lifecycle-preload-shim-quiet/simerr.txt m5out-hip-api-lifecycle-preload-shim-quiet/hip-api-lifecycle-preload.trace
+rg -n "^finalTick|^simTicks|^hostSeconds|^hostTickRate|^simSeconds|^simInsts|^simOps" m5out-hip-api-lifecycle-preload-shim-quiet/stats.txt
+```
+
+First relevant observable result:
+
+```text
+[hip_lifecycle_preload] begin hipFree
+[hip_lifecycle_preload] end hipFree
+HIP_LIFECYCLE_PRELOAD_PASSED
+Exiting @ tick 47195519571 because m5_exit instruction encountered.
+```
+
+Key trace evidence:
+
+```text
+47169537247: board.gpus0.se_sdma_engine: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ab88 src 0xffffffffffffffff via Ruby atomic
+47169614503: board.gpus0.se_sdma_engine: SDMA queue 2 drained at rptr 84
+47178126316: board.gpus0.se_sdma_engine: SDMA atomic ADD64 queue 2 addr 0x7ffdeee7ab88 src 0xffffffffffffffff via Ruby atomic
+47178245197: board.gpus0.se_sdma_engine: SDMA queue 2 drained at rptr 168
+```
+
+Shim evidence:
+
+```text
+[se_hip_compat] hipFree shim: skip ROCm free path for 0x7ffdee800000
+```
+
+Facts confirmed:
+
+- The lifecycle smoke completed all phase markers through `end hipFree`.
+- The program printed `HIP_LIFECYCLE_PRELOAD_PASSED`.
+- The simulation exited normally through `m5_exit` at tick `47195519571`.
+- The previous lifecycle stall at `begin hipFree` is removed when using the
+  rebuilt preload library.
+- Both H2D and D2H copy completions used the single Ruby atomic SDMA signal
+  path and drained queue 2.
+- No `panic`, `fatal`, `assert`, `Invalid transition`, `FAILED`, or `mismatch`
+  appeared in the inspected stdout/stderr/trace output.
+
+Hypotheses accepted or rejected:
+
+- Accepted: the current preload compatibility layer supports the lifecycle
+  sequence `hipMalloc -> hipMemset -> hipMemcpy H2D -> hipMemcpy D2H ->
+  hipFree` for this smoke.
+- Accepted: the `hipFree` shim is sufficient to remove the observed SE-mode
+  native `hipFree` stall in this lifecycle case.
+- Rejected for this run: SDMA copy completion is regressed by the lifecycle
+  shim; both SDMA operations completed and drained.
+
+Files changed:
+
+- this status document only.
+
+Verification completed:
+
+- Read-only inspection of stdout, stderr, trace, stats, and command line for
+  the lifecycle preload shim run.
+
+Single next diagnostic step: review the tracked diff for commit readiness,
+including documenting that `hipFree` is currently a deliberate SE-mode preload
+shim that leaks target allocations instead of exercising ROCm native free.
